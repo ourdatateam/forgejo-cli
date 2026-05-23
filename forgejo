@@ -1,0 +1,5101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="$HOME/.config/forgejo-cli/config"
+JSON_OUTPUT=0
+FORGEJO_URL=""
+FORGEJO_TOKEN=""
+FORGEJO_LOG_PATH=""
+FORGEJO_PASSWORD=""
+
+check_deps() {
+    local missing=()
+    command -v jq &>/dev/null || missing+=("jq")
+    command -v curl &>/dev/null || missing+=("curl")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Missing dependencies: ${missing[*]}" >&2
+        echo "Install with: sudo apt install ${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Config file not found: $CONFIG_FILE" >&2
+        echo "" >&2
+        echo "Create it with:" >&2
+        echo "  mkdir -p ~/.config/forgejo-cli" >&2
+        echo "  cat > ~/.config/forgejo-cli/config << 'EOF'" >&2
+        echo "  FORGEJO_URL=https://forgejo.example.com" >&2
+        echo "  FORGEJO_TOKEN=your-token-here" >&2
+        echo "  EOF" >&2
+        echo "  chmod 600 ~/.config/forgejo-cli/config" >&2
+        exit 1
+    fi
+
+    local perms
+    perms=$(stat -c '%a' "$CONFIG_FILE")
+    if [[ "$perms" != "600" ]]; then
+        echo "Config file has insecure permissions: $perms (expected 600)" >&2
+        echo "Fix with: chmod 600 $CONFIG_FILE" >&2
+        exit 1
+    fi
+
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+
+    if [[ -z "${FORGEJO_URL:-}" || -z "${FORGEJO_TOKEN:-}" ]]; then
+        echo "Config file must set FORGEJO_URL and FORGEJO_TOKEN" >&2
+        exit 1
+    fi
+}
+
+api_call() {
+    local method="$1"
+    local endpoint="$2"
+    local body="${3:-}"
+    local url="${FORGEJO_URL}/api/v1/${endpoint}"
+    local tmp
+    tmp=$(mktemp)
+
+    local curl_args=(
+        -s
+        -X "$method"
+        -H "Authorization: token $FORGEJO_TOKEN"
+        -H "Accept: application/json"
+        -w '%{http_code}'
+        -o "$tmp"
+    )
+
+    if [[ -n "$body" ]]; then
+        curl_args+=(-H "Content-Type: application/json" -d "$body")
+    fi
+
+    local status rc=0
+    status=$(curl "${curl_args[@]}" "$url") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        rm -f "$tmp"
+        echo "forgejo: network error (curl exit $rc)" >&2
+        exit 1
+    fi
+
+    if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+        echo "API error ($status):" >&2
+        jq -r '.message // .error // .' "$tmp" >&2 2>/dev/null || cat "$tmp" >&2
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
+# Like api_call but does NOT exit on non-2xx. Returns the HTTP status on the
+# first line of stdout and the response body on subsequent lines. Caller is
+# responsible for splitting and acting. Used by branch_protect's idempotent
+# existence check; not used by cmd_api (which calls curl directly).
+#
+# Usage:
+#   out=$(api_call_status GET "repos/foo/bar/branch_protections/main")
+#   status=$(printf '%s' "$out" | head -1)
+#   body=$(printf '%s' "$out" | tail -n +2)
+api_call_status() {
+    local method="$1"
+    local endpoint="$2"
+    local body="${3:-}"
+    local url="${FORGEJO_URL}/api/v1/${endpoint}"
+    local tmp
+    tmp=$(mktemp)
+
+    local curl_args=(
+        -s
+        -X "$method"
+        -H "Authorization: token $FORGEJO_TOKEN"
+        -H "Accept: application/json"
+        -w '%{http_code}'
+        -o "$tmp"
+    )
+
+    if [[ -n "$body" ]]; then
+        curl_args+=(-H "Content-Type: application/json" -d "$body")
+    fi
+
+    local status rc=0
+    status=$(curl "${curl_args[@]}" "$url") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        rm -f "$tmp"
+        echo "forgejo: network error (curl exit $rc)" >&2
+        exit 1
+    fi
+
+    printf '%s\n' "$status"
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
+# Like api_call but with Accept: */* and no jq parsing. Streams response body
+# to stdout verbatim. On non-2xx, prints raw body to stderr and exits 1.
+# Used by pr_diff to surface raw .diff/.patch output.
+api_call_raw() {
+    local method="$1"
+    local endpoint="$2"
+    local url="${FORGEJO_URL}/api/v1/${endpoint}"
+    local tmp
+    tmp=$(mktemp)
+
+    local status rc=0
+    status=$(curl -s -X "$method" \
+        -H "Authorization: token $FORGEJO_TOKEN" \
+        -H "Accept: */*" \
+        -w '%{http_code}' \
+        -o "$tmp" \
+        "$url") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        rm -f "$tmp"
+        echo "forgejo: network error (curl exit $rc)" >&2
+        exit 1
+    fi
+
+    if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+        echo "API error ($status):" >&2
+        cat "$tmp" >&2
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
+# Like api_call but authenticates with HTTP Basic (username + FORGEJO_PASSWORD)
+# instead of bearer token. Required for /users/{u}/tokens endpoints, which
+# Forgejo does not allow over bearer auth. Exits with a setup hint if
+# FORGEJO_PASSWORD is unset.
+api_call_basic() {
+    local method="$1"
+    local username="$2"
+    local endpoint="$3"
+    local body="${4:-}"
+    if [[ -z "$FORGEJO_PASSWORD" ]]; then
+        echo "FORGEJO_PASSWORD is not set in $CONFIG_FILE." >&2
+        echo "Forgejo's token endpoints require basic auth, not bearer." >&2
+        echo "Add to your config: FORGEJO_PASSWORD=your-account-password" >&2
+        exit 1
+    fi
+    local url="${FORGEJO_URL}/api/v1/${endpoint}"
+    local tmp
+    tmp=$(mktemp)
+
+    local curl_args=(
+        -s
+        -X "$method"
+        -u "${username}:${FORGEJO_PASSWORD}"
+        -H "Accept: application/json"
+        -w '%{http_code}'
+        -o "$tmp"
+    )
+    if [[ -n "$body" ]]; then
+        curl_args+=(-H "Content-Type: application/json" -d "$body")
+    fi
+
+    local status rc=0
+    status=$(curl "${curl_args[@]}" "$url") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        rm -f "$tmp"
+        echo "forgejo: network error (curl exit $rc)" >&2
+        exit 1
+    fi
+
+    if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+        echo "API error ($status):" >&2
+        jq -r '.message // .error // .' "$tmp" >&2 2>/dev/null || cat "$tmp" >&2
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
+confirm_delete() {
+    local resource_type="$1"
+    local resource_name="$2"
+    shift 2
+    if has_flag "--yes" "$@"; then
+        return 0
+    fi
+    echo "Are you sure you want to delete $resource_type \"$resource_name\"?"
+    read -rp "Type the name to confirm: " confirm
+    if [[ "$confirm" != "$resource_name" ]]; then
+        echo "Aborted." >&2
+        exit 1
+    fi
+}
+
+get_flag() {
+    local flag="$1"
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            "$flag"=*) echo "${1#*=}"; return 0 ;;
+            "$flag") echo "${2:-}"; return 0 ;;
+        esac
+        shift
+    done
+    return 1
+}
+
+has_flag() {
+    local flag="$1"
+    shift
+    while [[ $# -gt 0 ]]; do
+        [[ "$1" == "$flag" ]] && return 0
+        shift
+    done
+    return 1
+}
+
+# Resolves the SSH key string for `repo key add` from either --key= or
+# --key-file=. Errors if neither or both supplied. Prints the key to stdout.
+read_key_input() {
+    local key
+    local key_file
+    key=$(get_flag "--key" "$@" 2>/dev/null) || key=""
+    key_file=$(get_flag "--key-file" "$@" 2>/dev/null) || key_file=""
+
+    if [[ -n "$key" && -n "$key_file" ]]; then
+        echo "Provide --key OR --key-file, not both" >&2; exit 1
+    fi
+    if [[ -z "$key" && -z "$key_file" ]]; then
+        echo "Missing --key or --key-file" >&2; exit 1
+    fi
+    if [[ -n "$key_file" ]]; then
+        [[ -r "$key_file" ]] || { echo "Cannot read key file: $key_file" >&2; exit 1; }
+        cat "$key_file"
+    else
+        printf '%s\n' "$key"
+    fi
+}
+
+show_usage() {
+    cat << 'USAGE'
+Usage: forgejo <resource> <action> [args] [--json]
+
+Resources:
+  api      Generic API passthrough (escape hatch)
+  branch   Manage branches and branch protection
+  repo     Manage repositories
+  issue    Manage issues
+  actions  CI/Actions workflow runs
+  pr       Pull requests
+  release  Releases and tags
+  user     Manage users (admin)
+  org      Manage organizations
+  admin    Server administration (cron, config)
+  auth         Authentication status (whoami)
+  notification Notification inbox
+  search       Search across the instance
+
+Global flags:
+  --json   Output raw JSON instead of formatted columns
+  --help   Show this help
+
+API commands:
+  api [METHOD] <path> [-f key=val]... [-F key=val]... [--input -]
+                                                        Generic API passthrough.
+                                                        METHOD defaults to GET.
+                                                        -f: string field; -F: typed
+                                                        (bool/int/@file). Paths
+                                                        starting with / auto-prefix
+                                                        with /api/v1. Body to
+                                                        stdout; exit 22 on HTTP error.
+
+Repo commands:
+  repo list [org]                                       List repos
+  repo create <name> [--org=X] [--private] [--desc=X]  Create repo
+  repo view <owner/repo>                                View repo details
+  repo edit <owner/repo> [--desc=X] [--private|--public] Edit repo
+  repo delete <owner/repo>                              Delete repo
+  repo fork <owner/repo> [--org=X]                      Fork repo (idempotent on 409)
+  repo transfer <owner/repo> --new-owner=X [--new-name=X]  Transfer repo ownership (confirms)
+  repo archive <owner/repo>                             Archive repo (idempotent)
+  repo unarchive <owner/repo>                           Unarchive repo (idempotent)
+  repo tags list <owner/repo>                           List tags
+  repo tags create <owner/repo> --tag=X [--message=X] [--target=<sha|branch>]  Create tag
+  repo tags delete <owner/repo> <tag>                   Delete tag
+  repo collaborator list <owner/repo>                   List collaborators
+  repo collaborator add <owner/repo> --user=X [--permission=read|write|admin]  Add collaborator (default write)
+  repo collaborator remove <owner/repo> --user=X        Remove collaborator
+  repo webhook list <owner/repo>                        List webhooks
+  repo webhook view <owner/repo> <id>                   View webhook detail
+  repo webhook create <owner/repo> --url=X --events=a,b [--secret=X] [--content-type=json|form] [--inactive]  Create forgejo-type webhook
+  repo webhook edit <owner/repo> <id> [--url=X] [--events=a,b] [--secret=X] [--content-type=X] [--active|--inactive]  Edit webhook (partial)
+  repo webhook delete <owner/repo> <id>                 Delete webhook
+  repo key list <owner/repo>                            List deploy keys
+  repo key add <owner/repo> --title=X (--key=X | --key-file=path) [--read-only]  Add deploy key
+  repo key delete <owner/repo> <id>                     Delete deploy key
+  repo topic list <owner/repo>                          List topics
+  repo topic add <owner/repo> --topics=a,b              Add topics (idempotent per topic)
+  repo topic remove <owner/repo> --topics=a,b           Remove topics
+  repo mirror sync <owner/repo>                         Trigger push-mirror sync
+
+Issue commands:
+  issue list <owner/repo> [--state=open|closed]         List issues
+  issue create <owner/repo> --title=X [--body=X]        Create issue
+  issue view <owner/repo> <number>                      View issue + comments
+  issue edit <owner/repo> <number> [--title=X] [--state=X] [--body=X] [--labels=X,Y]  Edit issue
+  issue comment <owner/repo> <number> --body=X          Add comment
+  issue comment delete <owner/repo> <comment_id>        Delete comment
+  issue label <owner/repo> list [--scope=org|repo]      List labels (default: org)
+  issue label <owner/repo> create --name=X [--color=X] [--desc=X] [--scope=org|repo]
+  issue label <owner/repo> add <number> --labels=X,Y    Add labels to issue
+  issue label <owner/repo> remove <number> --label=X    Remove label from issue
+  issue close <owner/repo> <number>                     Close issue
+  issue reopen <owner/repo> <number>                    Reopen issue
+  issue assign <owner/repo> <number> --users=u1,u2      Add assignees (union)
+  issue unassign <owner/repo> <number> --users=u1,u2    Remove assignees
+  issue search [--owner=X] [--state=open|closed|all] [--labels=a,b] [--query=text] [--limit=N]  Cross-repo search
+  issue milestone <list|create|edit|delete|set> [args]   Milestone CRUD + set on issue
+
+Actions commands:
+  actions list <owner/repo>                             List recent workflow runs
+  actions view <owner/repo> <run_id>                    View run details + jobs
+  actions watch <owner/repo> <run_id>                   Poll until run completes
+  actions logs <owner/repo> <run_id>                    View run logs (browser link;
+                                                        reads from disk if
+                                                        FORGEJO_LOG_PATH is set)
+  actions runner list <owner/repo|org|--admin>          List Actions runners (scope)
+  actions runner register <owner/repo|org|--admin>      Print runner registration token
+  actions runner delete <owner/repo|org|--admin> <id> [--yes]  Remove runner
+  actions workflow list <owner/repo>                    List workflow files in repo
+  actions workflow dispatch <owner/repo> --workflow=X --ref=Y [--input=k=v]...  Trigger workflow
+  actions secret list <owner/repo|org>                  List secrets (names only)
+  actions secret set <owner/repo|org> --name=X --value=X  Create or update secret
+  actions secret delete <owner/repo|org> <name> [--yes]  Delete secret
+  actions variable list <owner/repo|org>                List variables
+  actions variable set <owner/repo|org> --name=X --value=X  Create or update variable (idempotent)
+  actions variable delete <owner/repo|org> <name> [--yes]  Delete variable
+
+PR commands:
+  pr list <owner/repo> [--state=open|closed|all]        List pull requests
+  pr create <owner/repo> --title=X --head=X [--base=main] [--body=X]  Create PR
+  pr view <owner/repo> <number>                         View PR details
+  pr merge <owner/repo> <number> [--method=merge|rebase|squash]  Merge PR
+  pr close <owner/repo> <number>                        Close PR (no merge)
+  pr edit <owner/repo> <number> [--title=X] [--body=X] [--base=X]   Edit PR
+  pr ready <owner/repo> <number>                        Mark draft PR ready
+  pr comment <owner/repo> <number> --body=X             Comment on PR
+  pr diff <owner/repo> <number>                         Raw unified diff
+  pr files <owner/repo> <number>                        Changed file list
+  pr checks <owner/repo> <number>                       Commit statuses + Actions runs
+  pr review <owner/repo> <number> --approve|--request-changes|--comment [--body=X]   Submit review
+  pr review list <owner/repo> <number>                  List reviews
+  pr review dismiss <owner/repo> <number> <review_id> --message=X   Dismiss a review
+  pr requested-reviewers add <owner/repo> <number> --users=u1,u2     Request reviewers
+  pr requested-reviewers remove <owner/repo> <number> --users=u1,u2  Withdraw reviewer requests
+
+Release commands:
+  release list <owner/repo>                             List releases
+  release create <owner/repo> --tag=X --title=X [--body=X] [--draft] [--prerelease]  Create release
+  release view <owner/repo> <tag>                       View release detail
+  release edit <owner/repo> <tag> [--title=X] [--body=X] [--draft|--no-draft] [--prerelease|--no-prerelease]  Edit release
+  release delete <owner/repo> <tag> [--yes]             Delete release (confirms by tag)
+  release upload-asset <owner/repo> <tag> <file>...     Upload one or more asset files (fail-fast)
+  release asset list <owner/repo> <tag>                 List release assets
+  release asset delete <owner/repo> <tag> <asset_id> [--yes]  Delete asset (confirms by id)
+
+User commands (admin):
+  user list                                             List users
+  user create --login=X --email=X --password=X [--admin] [--fullname=X]  Create user
+  user view <username>                                  View user
+  user edit <username> [--email=X] [--admin=true|false] [--active=true|false]  Edit user
+  user delete <username>                                Delete user
+  user key list <user|--self>
+  user key add <user|--self> --title=T --key=<contents-or-@file>
+  user key delete <user|--self> <id> [--yes]
+  user gpg list <user|--self>
+  user gpg add --self --armored=<contents-or-@file>
+  user gpg delete --self <id> [--yes]
+  user token list <user>
+  user token create <user> --name=N [--scopes=S1,S2,...]
+  user token delete <user> <name> [--yes]
+
+Org commands:
+  org list                                              List orgs
+  org create <name> [--desc=X] [--visibility=X]         Create org
+  org view <name>                                       View org + members
+  org edit <name> [--desc=X] [--visibility=X]           Edit org
+  org delete <name>                                     Delete org
+  org member list <org>
+  org member remove <org> --user=<user>
+  org team list <org>
+  org team view <org> <team-name-or-id>
+  org team create <org> --name=N [--description=D] [--permission=read|write|admin]
+  org team edit <org> <team> [--name=N] [--description=D] [--permission=P]
+  org team delete <org> <team> [--yes]
+  org team member list|add|remove <org> <team> [--user=U]
+  org team repo list|add|remove <org> <team> [--repo=owner/repo]
+
+Branch commands:
+  branch list <owner/repo>                              List branches
+  branch view <owner/repo> <branch>                     View branch + protection
+  branch delete <owner/repo> <branch>                   Delete branch
+  branch protect <owner/repo> <branch> [flags]          Apply/update protection (idempotent)
+                                                        Flags: --no-push, --push-whitelist=u1,u2,
+                                                        --merge-whitelist=u1,u2, --required-approvals=N,
+                                                        --dismiss-stale-approvals, --require-signed,
+                                                        --block-on-outdated
+  branch unprotect <owner/repo> <branch>                Remove protection
+
+Admin commands:
+  admin cron list                                       List cron tasks (name/schedule/next/prev/exec_times)
+  admin cron run <name>                                 Trigger a cron task
+  admin config view                                     Show server settings (api/attachment/repository/ui)
+  admin queue list|view|pause|resume                    Not exposed by Forgejo API - use web UI
+  admin stats                                           Not exposed by Forgejo API - use web UI
+  admin notice list|delete                              Not exposed by Forgejo API - use web UI
+
+Auth commands:
+  auth status                                           Print URL/login/email + scopes-not-exposed note
+
+Notification commands:
+  notification list [--all] [--status=unread|read|pinned] [--limit=N]   List inbox
+  notification read <id>                                Mark a thread as read
+  notification read --all                               Mark all unread as read
+
+Search commands:
+  search repos --query=X [--owner=X] [--limit=N]        Search repos
+  search users --query=X [--limit=N]                    Search users
+  search issues --query=X [--type=issue|pr] [--state=open|closed|all] [--owner=X] [--limit=N]   Search issues+PRs
+
+USAGE
+}
+
+# --- RESOURCE COMMANDS (stubs for now) ---
+
+cmd_repo() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo <list|create|view|edit|delete|fork|transfer|archive|unarchive|tags|collaborator|webhook|key|topic|mirror> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)      repo_list "$@" ;;
+        create)    repo_create "$@" ;;
+        view)      repo_view "$@" ;;
+        edit)      repo_edit "$@" ;;
+        delete)    repo_delete "$@" ;;
+        fork)      repo_fork "$@" ;;
+        transfer)  repo_transfer "$@" ;;
+        archive)   repo_archive "$@" ;;
+        unarchive) repo_unarchive "$@" ;;
+        tags)          cmd_repo_tags "$@" ;;
+        collaborator)  cmd_repo_collaborator "$@" ;;
+        webhook)       cmd_repo_webhook "$@" ;;
+        key)       cmd_repo_key "$@" ;;
+        topic)     cmd_repo_topic "$@" ;;
+        mirror)    cmd_repo_mirror "$@" ;;
+        *)             echo "Unknown repo action: $action" >&2; exit 1 ;;
+    esac
+}
+
+repo_list() {
+    local endpoint="user/repos?limit=50"
+    local org
+    if org=$(get_flag "--org" "$@" 2>/dev/null) || [[ $# -gt 0 && "$1" != --* ]]; then
+        org="${org:-$1}"
+        endpoint="orgs/$org/repos?limit=50"
+    fi
+
+    local result
+    result=$(api_call GET "$endpoint")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["NAME","PRIVATE","STARS","UPDATED"],
+            (.[] | [.full_name, (if .private then "yes" else "no" end), (.stars_count|tostring), .updated_at[:10]])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+repo_create() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo create <name> [--org=X] [--private] [--desc=X]" >&2
+        exit 1
+    fi
+
+    local name="$1"
+    shift
+    local org=""
+    local private="false"
+    local desc=""
+
+    org=$(get_flag "--org" "$@" 2>/dev/null) || true
+    desc=$(get_flag "--desc" "$@" 2>/dev/null) || true
+    has_flag "--private" "$@" && private="true"
+
+    local body
+    body=$(jq -n \
+        --arg name "$name" \
+        --arg desc "$desc" \
+        --argjson private "$private" \
+        '{name: $name, description: $desc, private: $private}')
+
+    local endpoint="user/repos"
+    if [[ -n "$org" ]]; then
+        endpoint="orgs/$org/repos"
+    fi
+
+    local result
+    result=$(api_call POST "$endpoint" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created: \(.full_name)\nURL: \(.html_url)\nSSH: \(.ssh_url)"'
+    fi
+}
+
+repo_view() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo view <owner/repo>" >&2
+        exit 1
+    fi
+
+    local result
+    result=$(api_call GET "repos/$1")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "Name:        \(.full_name)",
+            "Description: \(.description // "-")",
+            "Private:     \(if .private then "yes" else "no" end)",
+            "Stars:       \(.stars_count)",
+            "Forks:       \(.forks_count)",
+            "HTTP URL:    \(.clone_url)",
+            "SSH URL:     \(.ssh_url)",
+            "Created:     \(.created_at[:10])",
+            "Updated:     \(.updated_at[:10])"
+        '
+    fi
+}
+
+repo_edit() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo edit <owner/repo> [--desc=X] [--private] [--public]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    shift
+    local body="{}"
+
+    local desc
+    if desc=$(get_flag "--desc" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg d "$desc" '. + {description: $d}')
+    fi
+    if has_flag "--private" "$@"; then
+        body=$(echo "$body" | jq '. + {private: true}')
+    fi
+    if has_flag "--public" "$@"; then
+        body=$(echo "$body" | jq '. + {private: false}')
+    fi
+
+    local result
+    result=$(api_call PATCH "repos/$repo" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Updated: $(echo "$result" | jq -r '.full_name')"
+    fi
+}
+
+repo_delete() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo delete <owner/repo> [--yes]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    confirm_delete "repo" "$repo" "$@"
+    api_call DELETE "repos/$repo" > /dev/null
+    echo "Deleted: $repo"
+}
+
+repo_fork() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo fork <owner/repo> [--org=X]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+    local org=""
+    org=$(get_flag "--org" "$@" 2>/dev/null) || true
+
+    local body="{}"
+    if [[ -n "$org" ]]; then
+        body=$(jq -n --arg o "$org" '{organization: $o}')
+    fi
+
+    local out
+    local status
+    local response
+    out=$(api_call_status POST "repos/$repo/forks" "$body")
+    status=$(printf '%s' "$out" | head -1)
+    response=$(printf '%s' "$out" | tail -n +2)
+
+    if [[ "$status" -ge 200 && "$status" -lt 300 ]]; then
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            echo "$response" | jq .
+        else
+            echo "$response" | jq -r '"Forked: \(.full_name)\nURL: \(.html_url)"'
+        fi
+        return 0
+    fi
+
+    if [[ "$status" -eq 409 ]]; then
+        # Fork already exists. Predict target owner and fetch it.
+        local target_owner
+        if [[ -n "$org" ]]; then
+            target_owner="$org"
+        else
+            target_owner=$(api_call GET "user" | jq -r .login)
+        fi
+        local repo_name="${repo##*/}"
+        local existing
+        existing=$(api_call GET "repos/$target_owner/$repo_name")
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            echo "$existing" | jq .
+        else
+            echo "$existing" | jq -r '"Fork already exists: \(.full_name)\nURL: \(.html_url)"'
+        fi
+        return 0
+    fi
+
+    echo "API error ($status):" >&2
+    echo "$response" | jq -r '.message // .error // .' >&2 2>/dev/null || echo "$response" >&2
+    exit 1
+}
+
+repo_transfer() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo transfer <owner/repo> --new-owner=X [--new-name=X]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local new_owner
+    local new_name
+    new_owner=$(get_flag "--new-owner" "$@" 2>/dev/null) || { echo "Missing --new-owner" >&2; exit 1; }
+    new_name=$(get_flag "--new-name" "$@" 2>/dev/null) || new_name=""
+
+    confirm_delete "repo (transfer)" "$repo"
+
+    local body
+    if [[ -n "$new_name" ]]; then
+        body=$(jq -n --arg o "$new_owner" --arg n "$new_name" '{new_owner: $o, new_repo_name: $n}')
+    else
+        body=$(jq -n --arg o "$new_owner" '{new_owner: $o}')
+    fi
+
+    local out
+    local status
+    local response
+    out=$(api_call_status POST "repos/$repo/transfer" "$body")
+    status=$(printf '%s' "$out" | head -1)
+    response=$(printf '%s' "$out" | tail -n +2)
+
+    if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+        echo "API error ($status):" >&2
+        echo "$response" | jq -r '.message // .error // .' >&2 2>/dev/null || echo "$response" >&2
+        exit 1
+    fi
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$response" | jq .
+        return 0
+    fi
+
+    if [[ "$status" -eq 202 ]]; then
+        echo "Transfer initiated. Recipient ($new_owner) must accept before it completes."
+    else
+        echo "Transferred: $(echo "$response" | jq -r '.full_name')"
+    fi
+}
+
+repo_archive() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo archive <owner/repo>" >&2
+        exit 1
+    fi
+    api_call PATCH "repos/$1" '{"archived": true}' > /dev/null
+    echo "Archived: $1"
+}
+
+repo_unarchive() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo unarchive <owner/repo>" >&2
+        exit 1
+    fi
+    api_call PATCH "repos/$1" '{"archived": false}' > /dev/null
+    echo "Unarchived: $1"
+}
+
+cmd_repo_tags() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo tags <list|create|delete> [args]" >&2
+        exit 1
+    fi
+    local action="$1"
+    shift
+    case "$action" in
+        list)   repo_tags_list "$@" ;;
+        create) repo_tags_create "$@" ;;
+        delete) repo_tags_delete "$@" ;;
+        *)      echo "Unknown tags action: $action" >&2; exit 1 ;;
+    esac
+}
+
+repo_tags_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo tags list <owner/repo>" >&2
+        exit 1
+    fi
+    local result
+    result=$(api_call GET "repos/$1/tags")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["NAME","COMMIT","MESSAGE"],
+            (.[] | [.name, (.commit.sha[:7] // "-"), ((.message // "") | split("\n")[0])])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+repo_tags_create() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo tags create <owner/repo> --tag=X [--message=X] [--target=<sha|branch>]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local tag
+    local message
+    local target
+    tag=$(get_flag "--tag" "$@" 2>/dev/null) || { echo "Missing --tag" >&2; exit 1; }
+    message=$(get_flag "--message" "$@" 2>/dev/null) || message=""
+    target=$(get_flag "--target" "$@" 2>/dev/null) || target=""
+
+    local body
+    body=$(jq -n \
+        --arg t "$tag" \
+        --arg m "$message" \
+        --arg tgt "$target" \
+        '{tag_name: $t} + (if $m != "" then {message: $m} else {} end) + (if $tgt != "" then {target: $tgt} else {} end)')
+
+    local result
+    result=$(api_call POST "repos/$repo/tags" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created tag: \(.name) at \(.commit.sha[:7])"'
+    fi
+}
+
+repo_tags_delete() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo repo tags delete <owner/repo> <tag>" >&2
+        exit 1
+    fi
+    api_call DELETE "repos/$1/tags/$2" > /dev/null
+    echo "Deleted tag: $2 from $1"
+}
+
+cmd_repo_collaborator() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo collaborator <list|add|remove> [args]" >&2
+        exit 1
+    fi
+    local action="$1"
+    shift
+    case "$action" in
+        list)   repo_collab_list "$@" ;;
+        add)    repo_collab_add "$@" ;;
+        remove) repo_collab_remove "$@" ;;
+        *)      echo "Unknown collaborator action: $action" >&2; exit 1 ;;
+    esac
+}
+
+repo_collab_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo collaborator list <owner/repo>" >&2
+        exit 1
+    fi
+    local result
+    result=$(api_call GET "repos/$1/collaborators")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["LOGIN","FULL_NAME","EMAIL"],
+            (.[] | [.login, (.full_name // "-"), (.email // "-")])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+repo_collab_add() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo collaborator add <owner/repo> --user=X [--permission=read|write|admin]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local user
+    local permission
+    user=$(get_flag "--user" "$@" 2>/dev/null) || { echo "Missing --user" >&2; exit 1; }
+    permission=$(get_flag "--permission" "$@" 2>/dev/null) || permission="write"
+
+    local body
+    body=$(jq -n --arg p "$permission" '{permission: $p}')
+    api_call PUT "repos/$repo/collaborators/$user" "$body" > /dev/null
+    echo "Added collaborator $user to $repo with permission=$permission"
+}
+
+repo_collab_remove() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo collaborator remove <owner/repo> --user=X" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local user
+    user=$(get_flag "--user" "$@" 2>/dev/null) || { echo "Missing --user" >&2; exit 1; }
+
+    api_call DELETE "repos/$repo/collaborators/$user" > /dev/null
+    echo "Removed collaborator $user from $repo"
+}
+
+cmd_repo_webhook() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo webhook <list|view|create|edit|delete> [args]" >&2
+        exit 1
+    fi
+    local action="$1"
+    shift
+    case "$action" in
+        list)   repo_webhook_list "$@" ;;
+        view)   repo_webhook_view "$@" ;;
+        create) repo_webhook_create "$@" ;;
+        edit)   repo_webhook_edit "$@" ;;
+        delete) repo_webhook_delete "$@" ;;
+        *)      echo "Unknown webhook action: $action" >&2; exit 1 ;;
+    esac
+}
+
+repo_webhook_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo webhook list <owner/repo>" >&2
+        exit 1
+    fi
+    local result
+    result=$(api_call GET "repos/$1/hooks")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["ID","URL","ACTIVE","EVENTS"],
+            (.[] | [(.id|tostring), (.config.url // "-"), (if .active then "yes" else "no" end), (.events | join(","))])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+repo_webhook_view() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo repo webhook view <owner/repo> <id>" >&2
+        exit 1
+    fi
+    local result
+    result=$(api_call GET "repos/$1/hooks/$2")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "ID:           \(.id)",
+            "URL:          \(.config.url // "-")",
+            "ContentType:  \(.config.content_type // "-")",
+            "Active:       \(if .active then "yes" else "no" end)",
+            "Events:       \(.events | join(","))",
+            "Created:      \(.created_at[:19])",
+            "Updated:      \(.updated_at[:19])"
+        '
+    fi
+}
+
+repo_webhook_create() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo webhook create <owner/repo> --url=X --events=a,b [--secret=X] [--content-type=json|form] [--inactive]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local url
+    local events
+    local secret
+    local content_type
+    url=$(get_flag "--url" "$@" 2>/dev/null) || { echo "Missing --url" >&2; exit 1; }
+    events=$(get_flag "--events" "$@" 2>/dev/null) || { echo "Missing --events" >&2; exit 1; }
+    secret=$(get_flag "--secret" "$@" 2>/dev/null) || secret=""
+    content_type=$(get_flag "--content-type" "$@" 2>/dev/null) || content_type="json"
+
+    local active="true"
+    has_flag "--inactive" "$@" && active="false"
+
+    local events_json
+    events_json=$(echo "$events" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+
+    local config_json
+    config_json=$(jq -nc \
+        --arg u "$url" \
+        --arg c "$content_type" \
+        --arg s "$secret" \
+        '{url: $u, content_type: $c} + (if $s != "" then {secret: $s} else {} end)')
+
+    local body
+    body=$(jq -nc \
+        --argjson cfg "$config_json" \
+        --argjson ev "$events_json" \
+        --argjson act "$active" \
+        '{type: "forgejo", config: $cfg, events: $ev, active: $act}')
+
+    local result
+    result=$(api_call POST "repos/$repo/hooks" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created webhook #\(.id) on \(.config.url)"'
+    fi
+}
+
+repo_webhook_edit() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo repo webhook edit <owner/repo> <id> [--url=X] [--events=a,b] [--secret=X] [--content-type=X] [--active|--inactive]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local id="$2"
+    shift 2
+
+    if has_flag "--active" "$@" && has_flag "--inactive" "$@"; then
+        echo "--active and --inactive are mutually exclusive" >&2; exit 1
+    fi
+
+    local body="{}"
+
+    # Config keys (url / content_type / secret) — only included if any of them
+    # was supplied. PATCH accepts a partial config object that overlays.
+    local url
+    local content_type
+    local secret
+    local have_cfg=0
+    if url=$(get_flag "--url" "$@" 2>/dev/null); then have_cfg=1; fi
+    if content_type=$(get_flag "--content-type" "$@" 2>/dev/null); then have_cfg=1; fi
+    if secret=$(get_flag "--secret" "$@" 2>/dev/null); then have_cfg=1; fi
+
+    if [[ "$have_cfg" -eq 1 ]]; then
+        local cfg
+        cfg=$(jq -nc \
+            --arg u "${url:-}" \
+            --arg c "${content_type:-}" \
+            --arg s "${secret:-}" \
+            '{} + (if $u != "" then {url: $u} else {} end)
+               + (if $c != "" then {content_type: $c} else {} end)
+               + (if $s != "" then {secret: $s} else {} end)')
+        body=$(echo "$body" | jq --argjson cfg "$cfg" '. + {config: $cfg}')
+    fi
+
+    local events
+    if events=$(get_flag "--events" "$@" 2>/dev/null); then
+        local events_json
+        events_json=$(echo "$events" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+        body=$(echo "$body" | jq --argjson ev "$events_json" '. + {events: $ev}')
+    fi
+
+    if has_flag "--active" "$@"; then
+        body=$(echo "$body" | jq '. + {active: true}')
+    elif has_flag "--inactive" "$@"; then
+        body=$(echo "$body" | jq '. + {active: false}')
+    fi
+
+    if [[ "$body" == "{}" ]]; then
+        echo "No webhook fields supplied to edit" >&2; exit 1
+    fi
+
+    local result
+    result=$(api_call PATCH "repos/$repo/hooks/$id" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Updated webhook #$id on $repo"
+    fi
+}
+
+repo_webhook_delete() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo repo webhook delete <owner/repo> <id>" >&2
+        exit 1
+    fi
+    api_call DELETE "repos/$1/hooks/$2" > /dev/null
+    echo "Deleted webhook #$2 from $1"
+}
+
+cmd_repo_key() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo key <list|add|delete> [args]" >&2
+        exit 1
+    fi
+    local action="$1"
+    shift
+    case "$action" in
+        list)   repo_key_list "$@" ;;
+        add)    repo_key_add "$@" ;;
+        delete) repo_key_delete "$@" ;;
+        *)      echo "Unknown key action: $action" >&2; exit 1 ;;
+    esac
+}
+
+repo_key_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo key list <owner/repo>" >&2
+        exit 1
+    fi
+    local result
+    result=$(api_call GET "repos/$1/keys")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["ID","TITLE","FINGERPRINT","READONLY"],
+            (.[] | [(.id|tostring), (.title // "-"), (.fingerprint // "-"), (if .read_only then "yes" else "no" end)])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+repo_key_add() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo key add <owner/repo> --title=X (--key=X | --key-file=path) [--read-only]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local title
+    title=$(get_flag "--title" "$@" 2>/dev/null) || { echo "Missing --title" >&2; exit 1; }
+
+    local key
+    key=$(read_key_input "$@")
+
+    local read_only="false"
+    has_flag "--read-only" "$@" && read_only="true"
+
+    local body
+    body=$(jq -n \
+        --arg t "$title" \
+        --arg k "$key" \
+        --argjson ro "$read_only" \
+        '{title: $t, key: $k, read_only: $ro}')
+
+    local result
+    result=$(api_call POST "repos/$repo/keys" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Added deploy key #\(.id): \(.title)"'
+    fi
+}
+
+repo_key_delete() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo repo key delete <owner/repo> <id>" >&2
+        exit 1
+    fi
+    api_call DELETE "repos/$1/keys/$2" > /dev/null
+    echo "Deleted deploy key #$2 from $1"
+}
+
+cmd_repo_topic() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo topic <list|add|remove> [args]" >&2
+        exit 1
+    fi
+    local action="$1"
+    shift
+    case "$action" in
+        list)   repo_topic_list "$@" ;;
+        add)    repo_topic_add "$@" ;;
+        remove) repo_topic_remove "$@" ;;
+        *)      echo "Unknown topic action: $action" >&2; exit 1 ;;
+    esac
+}
+
+repo_topic_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo topic list <owner/repo>" >&2
+        exit 1
+    fi
+    local result
+    result=$(api_call GET "repos/$1/topics")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '.topics[]?'
+    fi
+}
+
+repo_topic_add() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo topic add <owner/repo> --topics=a,b" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local topics
+    topics=$(get_flag "--topics" "$@" 2>/dev/null) || { echo "Missing --topics" >&2; exit 1; }
+
+    local added=()
+    local t
+    while IFS= read -r t; do
+        [[ -z "$t" ]] && continue
+        api_call PUT "repos/$repo/topics/$t" > /dev/null
+        added+=("$t")
+    done < <(echo "$topics" | jq -Rr 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | .[]')
+    echo "Added topics to $repo: ${added[*]}"
+}
+
+repo_topic_remove() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo topic remove <owner/repo> --topics=a,b" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local topics
+    topics=$(get_flag "--topics" "$@" 2>/dev/null) || { echo "Missing --topics" >&2; exit 1; }
+
+    local removed=()
+    local t
+    while IFS= read -r t; do
+        [[ -z "$t" ]] && continue
+        api_call DELETE "repos/$repo/topics/$t" > /dev/null
+        removed+=("$t")
+    done < <(echo "$topics" | jq -Rr 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | .[]')
+    echo "Removed topics from $repo: ${removed[*]}"
+}
+
+cmd_repo_mirror() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo mirror <sync> [args]" >&2
+        exit 1
+    fi
+    local action="$1"
+    shift
+    case "$action" in
+        sync)   repo_mirror_sync "$@" ;;
+        *)      echo "Unknown mirror action: $action" >&2; exit 1 ;;
+    esac
+}
+
+repo_mirror_sync() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo repo mirror sync <owner/repo>" >&2
+        exit 1
+    fi
+    api_call POST "repos/$1/mirror-sync" > /dev/null
+    echo "Triggered mirror sync for $1"
+}
+
+cmd_issue() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo issue <list|create|view|edit|comment|label|close|reopen|assign|unassign|search|milestone> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)    issue_list "$@" ;;
+        create)  issue_create "$@" ;;
+        view)    issue_view "$@" ;;
+        edit)    issue_edit "$@" ;;
+        comment) issue_comment "$@" ;;
+        label)   issue_label "$@" ;;
+        close)   issue_close "$@" ;;
+        reopen)  issue_reopen "$@" ;;
+        assign)     issue_assign "$@" ;;
+        unassign)   issue_unassign "$@" ;;
+        search)     issue_search "$@" ;;
+        milestone)  issue_milestone "$@" ;;
+        *)       echo "Unknown issue action: $action" >&2; exit 1 ;;
+    esac
+}
+
+issue_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo issue list <owner/repo> [--state=open|closed]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    shift
+    local state
+    state=$(get_flag "--state" "$@" 2>/dev/null) || state="open"
+
+    local result
+    result=$(api_call GET "repos/$repo/issues?state=$state&type=issues&limit=50")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["#","TITLE","STATE","AUTHOR","UPDATED"],
+            (.[] | [(.number|tostring), .title[:60], .state, .user.login, .updated_at[:10]])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+issue_create() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo issue create <owner/repo> --title=X [--body=X] [--labels=X]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    shift
+
+    local title
+    title=$(get_flag "--title" "$@" 2>/dev/null) || { echo "Missing --title" >&2; exit 1; }
+    local body_text
+    body_text=$(get_flag "--body" "$@" 2>/dev/null) || body_text=""
+
+    local body
+    body=$(jq -n \
+        --arg title "$title" \
+        --arg body "$body_text" \
+        '{title: $title, body: $body}')
+
+    local result
+    result=$(api_call POST "repos/$repo/issues" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created issue #\(.number): \(.title)\nURL: \(.html_url)"'
+    fi
+}
+
+issue_view() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue view <owner/repo> <number>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local number="$2"
+
+    local result
+    result=$(api_call GET "repos/$repo/issues/$number")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "#\(.number): \(.title)",
+            "State:   \(.state)",
+            "Author:  \(.user.login)",
+            "Created: \(.created_at[:10])",
+            "Labels:  \(if (.labels | length) > 0 then ([.labels[].name] | join(", ")) else "-" end)",
+            "",
+            (.body // "(no body)")
+        '
+
+        echo ""
+        echo "--- Comments ---"
+
+        local comments
+        comments=$(api_call GET "repos/$repo/issues/$number/comments")
+        echo "$comments" | jq -r '
+            if length == 0 then "No comments."
+            else .[] | "[comment #\(.id)] \(.user.login) (\(.created_at[:10])):\n\(.body)\n"
+            end
+        '
+    fi
+}
+
+issue_edit() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue edit <owner/repo> <number> [--title=X] [--state=X] [--body=X] [--labels=X,Y]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local number="$2"
+    shift 2
+    local body="{}"
+
+    local val
+    if val=$(get_flag "--title" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {title: $v}')
+    fi
+    if val=$(get_flag "--state" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {state: $v}')
+    fi
+    if val=$(get_flag "--body" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {body: $v}')
+    fi
+
+    # Handle --labels: replace all labels on the issue
+    if val=$(get_flag "--labels" "$@" 2>/dev/null); then
+        local ids=()
+        IFS=',' read -ra label_names <<< "$val"
+        for name in "${label_names[@]}"; do
+            name=$(echo "$name" | xargs)  # trim whitespace
+            local id
+            id=$(resolve_label_id "$repo" "$name") || exit 1
+            ids+=("$id")
+        done
+        # Forgejo PATCH /issues accepts labels array of IDs
+        local labels_json
+        labels_json=$(printf '%s\n' "${ids[@]}" | jq -s '.')
+        body=$(echo "$body" | jq --argjson labels "$labels_json" '. + {labels: $labels}')
+    fi
+
+    local result
+    result=$(api_call PATCH "repos/$repo/issues/$number" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Updated issue #$(echo "$result" | jq -r '.number'): $(echo "$result" | jq -r '.title')"
+    fi
+}
+
+issue_comment() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue comment <owner/repo> <number> --body=X" >&2
+        echo "       forgejo issue comment delete <owner/repo> <comment_id>" >&2
+        exit 1
+    fi
+
+    # Handle: forgejo issue comment delete <owner/repo> <comment_id>
+    if [[ "$1" == "delete" ]]; then
+        if [[ $# -lt 3 ]]; then
+            echo "Usage: forgejo issue comment delete <owner/repo> <comment_id>" >&2
+            exit 1
+        fi
+        local repo="$2"
+        local comment_id="$3"
+        api_call DELETE "repos/$repo/issues/comments/$comment_id" > /dev/null
+        echo "Deleted comment #$comment_id"
+        return
+    fi
+
+    local repo="$1"
+    local number="$2"
+    shift 2
+
+    local body_text
+    body_text=$(get_flag "--body" "$@" 2>/dev/null) || { echo "Missing --body" >&2; exit 1; }
+
+    local body
+    body=$(jq -n --arg body "$body_text" '{body: $body}')
+
+    local result
+    result=$(api_call POST "repos/$repo/issues/$number/comments" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Comment added to issue #$number"
+    fi
+}
+issue_label() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue label <owner/repo> <action> [args]" >&2
+        echo "" >&2
+        echo "Actions:" >&2
+        echo "  list                          List repo labels" >&2
+        echo "  create --name=X [--color=X] [--desc=X]  Create label" >&2
+        echo "  add <number> --labels=X,Y     Add labels to issue" >&2
+        echo "  remove <number> --label=X     Remove label from issue" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local action="$2"
+    shift 2
+
+    case "$action" in
+        list)   label_list "$repo" "$@" ;;
+        create) label_create "$repo" "$@" ;;
+        add)    label_add "$repo" "$@" ;;
+        remove) label_remove "$repo" "$@" ;;
+        *)      echo "Unknown label action: $action" >&2; exit 1 ;;
+    esac
+}
+
+# Resolve label name to ID; checks org labels first, then repo labels
+resolve_label_id() {
+    local repo="$1"
+    local name="$2"
+    local org="${repo%%/*}"
+    local id=""
+
+    # Check org-level labels first
+    local org_labels
+    org_labels=$(api_call GET "orgs/$org/labels?limit=50" 2>/dev/null) || true
+    if [[ -n "$org_labels" ]]; then
+        id=$(echo "$org_labels" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+    fi
+
+    # Fall back to repo-level labels
+    if [[ -z "$id" ]]; then
+        local repo_labels
+        repo_labels=$(api_call GET "repos/$repo/labels?limit=50")
+        id=$(echo "$repo_labels" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+    fi
+
+    if [[ -z "$id" ]]; then
+        echo "Label not found: $name (in org $org or repo $repo)" >&2
+        return 1
+    fi
+    echo "$id"
+}
+
+# Resolve milestone identifier to numeric ID. If input is a positive integer,
+# echo it back. Otherwise treat as title, GET milestones (all states), and
+# find by exact title. Exits 1 if title not found.
+resolve_milestone_id() {
+    local repo="$1"
+    local input="$2"
+
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        echo "$input"
+        return 0
+    fi
+
+    local id
+    id=$(api_call GET "repos/$repo/milestones?state=all&limit=50" \
+        | jq -r --arg t "$input" '.[] | select(.title == $t) | .id' \
+        | head -1)
+
+    if [[ -z "$id" ]]; then
+        echo "Milestone not found: $input (in $repo)" >&2
+        return 1
+    fi
+    echo "$id"
+}
+
+label_list() {
+    local repo="$1"
+    local org="${repo%%/*}"
+    shift
+
+    # Check for --scope=repo flag, default to org
+    local scope
+    scope=$(get_flag "--scope" "$@" 2>/dev/null) || scope="org"
+
+    local result
+    if [[ "$scope" == "repo" ]]; then
+        result=$(api_call GET "repos/$repo/labels?limit=50")
+    else
+        result=$(api_call GET "orgs/$org/labels?limit=50")
+    fi
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["ID","NAME","COLOR","DESCRIPTION"],
+            (.[] | [(.id|tostring), .name, .color, (.description // "-")[:40]])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+label_create() {
+    local repo="$1"
+    local org="${repo%%/*}"
+    shift
+
+    local name color desc scope
+    name=$(get_flag "--name" "$@" 2>/dev/null) || { echo "Missing --name" >&2; exit 1; }
+    color=$(get_flag "--color" "$@" 2>/dev/null) || color="#0075ca"
+    desc=$(get_flag "--desc" "$@" 2>/dev/null) || desc=""
+    scope=$(get_flag "--scope" "$@" 2>/dev/null) || scope="org"
+
+    # Strip leading # from color if present
+    color="${color#\#}"
+
+    local body
+    body=$(jq -n \
+        --arg name "$name" \
+        --arg color "#$color" \
+        --arg desc "$desc" \
+        '{name: $name, color: $color, description: $desc}')
+
+    local endpoint
+    if [[ "$scope" == "repo" ]]; then
+        endpoint="repos/$repo/labels"
+    else
+        endpoint="orgs/$org/labels"
+    fi
+
+    local result
+    result=$(api_call POST "$endpoint" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Created label: $(echo "$result" | jq -r '.name') (id=$(echo "$result" | jq -r '.id'), scope=$scope)"
+    fi
+}
+
+label_add() {
+    local repo="$1"
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue label <owner/repo> add <number> --labels=X,Y" >&2
+        exit 1
+    fi
+    local number="$2"
+    shift 2
+
+    local labels_str
+    labels_str=$(get_flag "--labels" "$@" 2>/dev/null) || { echo "Missing --labels" >&2; exit 1; }
+
+    # Resolve each label name to ID
+    local ids=()
+    IFS=',' read -ra label_names <<< "$labels_str"
+    for name in "${label_names[@]}"; do
+        name=$(echo "$name" | xargs)  # trim whitespace
+        local id
+        id=$(resolve_label_id "$repo" "$name") || exit 1
+        ids+=("$id")
+    done
+
+    local body
+    body=$(printf '%s\n' "${ids[@]}" | jq -s '{labels: .}')
+
+    local result
+    result=$(api_call POST "repos/$repo/issues/$number/labels" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Added labels to issue #$number: $labels_str"
+    fi
+}
+
+label_remove() {
+    local repo="$1"
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue label <owner/repo> remove <number> --label=X" >&2
+        exit 1
+    fi
+    local number="$2"
+    shift 2
+
+    local label_name
+    label_name=$(get_flag "--label" "$@" 2>/dev/null) || { echo "Missing --label" >&2; exit 1; }
+
+    local id
+    id=$(resolve_label_id "$repo" "$label_name") || exit 1
+
+    api_call DELETE "repos/$repo/issues/$number/labels/$id" > /dev/null
+    echo "Removed label from issue #$number: $label_name"
+}
+
+# Add or remove assignees on an issue. GETs the current set, computes the
+# new set (union for "add", set-difference for "remove"), PATCHes back.
+# Always issues the PATCH even if the resulting set is unchanged.
+#
+# Args: <owner/repo> <number> <add|remove> <comma_separated_users>
+update_issue_assignees() {
+    local repo="$1"
+    local number="$2"
+    local op="$3"
+    local users_csv="$4"
+
+    if [[ -z "$users_csv" ]]; then
+        echo "No users provided" >&2
+        exit 1
+    fi
+
+    local users_json
+    users_json=$(echo "$users_csv" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+
+    local current
+    current=$(api_call GET "repos/$repo/issues/$number" | jq -c '[.assignees[]?.login]')
+
+    local new_set
+    if [[ "$op" == "add" ]]; then
+        new_set=$(jq -nc --argjson cur "$current" --argjson add "$users_json" \
+            '($cur + $add) | unique')
+    else
+        new_set=$(jq -nc --argjson cur "$current" --argjson rm "$users_json" \
+            '$cur - $rm')
+    fi
+
+    local body
+    body=$(jq -nc --argjson a "$new_set" '{assignees: $a}')
+
+    local result
+    result=$(api_call PATCH "repos/$repo/issues/$number" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        local verb final
+        if [[ "$op" == "add" ]]; then verb="Assigned"; else verb="Unassigned"; fi
+        final=$(echo "$result" | jq -r '[.assignees[]?.login] | join(", ") | if length == 0 then "(none)" else . end')
+        echo "$verb $users_csv on issue #$number. Current assignees: $final"
+    fi
+}
+
+issue_close() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue close <owner/repo> <number>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local number="$2"
+
+    local body
+    body=$(jq -n '{state: "closed"}')
+
+    local result
+    result=$(api_call PATCH "repos/$repo/issues/$number" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Closed issue #$number"
+    fi
+}
+
+issue_reopen() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue reopen <owner/repo> <number>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local number="$2"
+
+    local body
+    body=$(jq -n '{state: "open"}')
+
+    local result
+    result=$(api_call PATCH "repos/$repo/issues/$number" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Reopened issue #$number"
+    fi
+}
+
+issue_assign() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue assign <owner/repo> <number> --users=u1,u2" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    shift 2
+    local users
+    users=$(get_flag "--users" "$@" 2>/dev/null) || { echo "Missing --users" >&2; exit 1; }
+    update_issue_assignees "$repo" "$number" add "$users"
+}
+
+issue_unassign() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue unassign <owner/repo> <number> --users=u1,u2" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    shift 2
+    local users
+    users=$(get_flag "--users" "$@" 2>/dev/null) || { echo "Missing --users" >&2; exit 1; }
+    update_issue_assignees "$repo" "$number" remove "$users"
+}
+
+issue_search() {
+    local owner state labels query limit
+    owner=$(get_flag "--owner" "$@" 2>/dev/null) || owner=""
+    state=$(get_flag "--state" "$@" 2>/dev/null) || state="open"
+    labels=$(get_flag "--labels" "$@" 2>/dev/null) || labels=""
+    query=$(get_flag "--query" "$@" 2>/dev/null) || query=""
+    limit=$(get_flag "--limit" "$@" 2>/dev/null) || limit="50"
+
+    if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        echo "--limit must be a non-negative integer" >&2
+        exit 1
+    fi
+
+    local qs="type=issues&state=${state}&limit=${limit}"
+    if [[ -n "$owner" ]]; then
+        local owner_enc
+        owner_enc=$(printf '%s' "$owner" | jq -sRr @uri)
+        qs="${qs}&owner=${owner_enc}"
+    fi
+    if [[ -n "$labels" ]]; then
+        local labels_enc
+        labels_enc=$(printf '%s' "$labels" | jq -sRr @uri)
+        qs="${qs}&labels=${labels_enc}"
+    fi
+    if [[ -n "$query" ]]; then
+        local query_enc
+        query_enc=$(printf '%s' "$query" | jq -sRr @uri)
+        qs="${qs}&q=${query_enc}"
+    fi
+
+    local result
+    result=$(api_call GET "repos/issues/search?$qs")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+            echo "No issues found."
+        else
+            echo "$result" | jq -r '
+                ["REPO","#","TITLE","STATE","AUTHOR","UPDATED"],
+                (.[] | [
+                    (.repository.full_name // "-"),
+                    (.number|tostring),
+                    .title[:50],
+                    .state,
+                    .user.login,
+                    .updated_at[:10]
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
+issue_milestone() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo issue milestone <action> [args]" >&2
+        echo "" >&2
+        echo "Actions:" >&2
+        echo "  list <owner/repo> [--state=open|closed|all]" >&2
+        echo "  create <owner/repo> --title=X [--description=X] [--due=YYYY-MM-DD]" >&2
+        echo "  edit <owner/repo> <id> [--title=X] [--description=X] [--due=YYYY-MM-DD] [--state=open|closed]" >&2
+        echo "  delete <owner/repo> <id>" >&2
+        echo "  set <owner/repo> <number> --milestone=<id|title>" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)   milestone_list "$@" ;;
+        create) milestone_create "$@" ;;
+        edit)   milestone_edit "$@" ;;
+        delete) milestone_delete "$@" ;;
+        set)    milestone_set "$@" ;;
+        *)      echo "Unknown milestone action: $action" >&2; exit 1 ;;
+    esac
+}
+
+milestone_list() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: forgejo issue milestone list <owner/repo> [--state=open|closed|all]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+    local state
+    state=$(get_flag "--state" "$@" 2>/dev/null) || state="open"
+
+    local result
+    result=$(api_call GET "repos/$repo/milestones?state=${state}&limit=50")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+            echo "No milestones found."
+        else
+            echo "$result" | jq -r '
+                ["ID","TITLE","STATE","DUE","OPEN","CLOSED"],
+                (.[] | [
+                    (.id|tostring),
+                    .title[:40],
+                    .state,
+                    ((.due_on // "-")[:10]),
+                    (.open_issues|tostring),
+                    (.closed_issues|tostring)
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
+milestone_create() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: forgejo issue milestone create <owner/repo> --title=X [--description=X] [--due=YYYY-MM-DD]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    shift
+
+    local title desc due
+    title=$(get_flag "--title" "$@" 2>/dev/null) || { echo "Missing --title" >&2; exit 1; }
+    desc=$(get_flag "--description" "$@" 2>/dev/null) || desc=""
+    due=$(get_flag "--due" "$@" 2>/dev/null) || due=""
+
+    local due_iso=""
+    if [[ -n "$due" ]]; then
+        if ! [[ "$due" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "--due must be YYYY-MM-DD" >&2
+            exit 1
+        fi
+        due_iso="${due}T00:00:00Z"
+    fi
+
+    local body
+    if [[ -n "$due_iso" ]]; then
+        body=$(jq -n --arg t "$title" --arg d "$desc" --arg due "$due_iso" \
+            '{title: $t, description: $d, due_on: $due}')
+    else
+        body=$(jq -n --arg t "$title" --arg d "$desc" \
+            '{title: $t, description: $d}')
+    fi
+
+    local result
+    result=$(api_call POST "repos/$repo/milestones" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created milestone #\(.id): \(.title)"'
+    fi
+}
+
+milestone_edit() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue milestone edit <owner/repo> <id> [--title=X] [--description=X] [--due=YYYY-MM-DD] [--state=open|closed]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local id="$2"
+    shift 2
+
+    local body="{}"
+    local val
+
+    if val=$(get_flag "--title" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {title: $v}')
+    fi
+    if val=$(get_flag "--description" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {description: $v}')
+    fi
+    if val=$(get_flag "--state" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {state: $v}')
+    fi
+    if val=$(get_flag "--due" "$@" 2>/dev/null); then
+        if ! [[ "$val" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "--due must be YYYY-MM-DD" >&2
+            exit 1
+        fi
+        body=$(echo "$body" | jq --arg v "${val}T00:00:00Z" '. + {due_on: $v}')
+    fi
+
+    if [[ "$body" == "{}" ]]; then
+        echo "No fields to update. Provide --title, --description, --due, or --state." >&2
+        exit 1
+    fi
+
+    local result
+    result=$(api_call PATCH "repos/$repo/milestones/$id" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Updated milestone #\(.id): \(.title) (state=\(.state))"'
+    fi
+}
+
+milestone_delete() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue milestone delete <owner/repo> <id>" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local id="$2"
+
+    api_call DELETE "repos/$repo/milestones/$id" > /dev/null
+    echo "Deleted milestone #$id"
+}
+
+milestone_set() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo issue milestone set <owner/repo> <number> --milestone=<id|title>" >&2
+        echo "  Pass --milestone=0 to clear." >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    shift 2
+
+    local raw
+    raw=$(get_flag "--milestone" "$@" 2>/dev/null) || { echo "Missing --milestone" >&2; exit 1; }
+
+    local id
+    if [[ "$raw" == "0" ]]; then
+        id=0
+    else
+        id=$(resolve_milestone_id "$repo" "$raw") || exit 1
+    fi
+
+    local body
+    body=$(jq -n --argjson m "$id" '{milestone: $m}')
+
+    local result
+    result=$(api_call PATCH "repos/$repo/issues/$number" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        local title
+        title=$(echo "$result" | jq -r '.milestone.title // "(none)"')
+        echo "Set milestone on issue #$number to: $title"
+    fi
+}
+
+# Resolves <team-name-or-id> to numeric team id within an org.
+# Numeric input passes through. Names hit /orgs/{org}/teams/search?q= and
+# match on exact .name (case-sensitive). Errors on no-match or ambiguous.
+resolve_team_id() {
+    local org="$1" needle="$2"
+    if [[ "$needle" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$needle"
+        return 0
+    fi
+    local result hits
+    result=$(api_call GET "orgs/$org/teams/search?q=$(jq -rn --arg s "$needle" '$s|@uri')")
+    hits=$(echo "$result" | jq --arg n "$needle" '[.data[]? | select(.name == $n)]')
+    local count
+    count=$(echo "$hits" | jq 'length')
+    if [[ "$count" -eq 0 ]]; then
+        echo "No team named '$needle' in org '$org'" >&2
+        echo "Available:" >&2
+        echo "$result" | jq -r '.data[]? | "  " + .name' >&2
+        exit 1
+    fi
+    if [[ "$count" -gt 1 ]]; then
+        echo "Ambiguous team name '$needle' in org '$org' (matched $count)" >&2
+        exit 1
+    fi
+    echo "$hits" | jq -r '.[0].id'
+}
+
+# Resolves --key=<value>: if value starts with '@', read file; else literal.
+# Strips trailing newline. Errors if file missing.
+read_key_arg() {
+    local val="$1"
+    if [[ "${val:0:1}" == "@" ]]; then
+        local path="${val:1}"
+        [[ -f "$path" ]] || { echo "Key file not found: $path" >&2; exit 1; }
+        # shellcheck disable=SC2005
+        printf '%s' "$(cat "$path")"
+    else
+        printf '%s' "$val"
+    fi
+}
+
+cmd_user() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo user <list|create|view|edit|delete|key|gpg|token> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)   user_list "$@" ;;
+        create) user_create "$@" ;;
+        view)   user_view "$@" ;;
+        edit)   user_edit "$@" ;;
+        delete) user_delete "$@" ;;
+        key)    cmd_user_key "$@" ;;
+        gpg)    cmd_user_gpg "$@" ;;
+        token)  cmd_user_token "$@" ;;
+        *)      echo "Unknown user action: $action" >&2; exit 1 ;;
+    esac
+}
+
+user_list() {
+    local result
+    result=$(api_call GET "admin/users?limit=50")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["LOGIN","EMAIL","ADMIN","ACTIVE","CREATED"],
+            (.[] | [.login, .email, (if .is_admin then "yes" else "no" end), (if .active then "yes" else "no" end), .created[:10]])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+user_create() {
+    local login email password fullname=""
+    local must_change="true"
+    local is_admin="false"
+
+    login=$(get_flag "--login" "$@" 2>/dev/null) || { echo "Missing --login" >&2; exit 1; }
+    email=$(get_flag "--email" "$@" 2>/dev/null) || { echo "Missing --email" >&2; exit 1; }
+    password=$(get_flag "--password" "$@" 2>/dev/null) || { echo "Missing --password" >&2; exit 1; }
+    fullname=$(get_flag "--fullname" "$@" 2>/dev/null) || fullname=""
+    has_flag "--admin" "$@" && is_admin="true"
+
+    local body
+    body=$(jq -n \
+        --arg login "$login" \
+        --arg email "$email" \
+        --arg password "$password" \
+        --arg fullname "$fullname" \
+        --argjson must_change "$must_change" \
+        --argjson is_admin "$is_admin" \
+        '{
+            username: $login,
+            email: $email,
+            password: $password,
+            full_name: $fullname,
+            must_change_password: $must_change,
+            login_name: $login,
+            source_id: 0,
+            visibility: "public"
+        } | if $is_admin then . + {site_admin: true} else . end')
+
+    local result
+    result=$(api_call POST "admin/users" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created user: \(.login) (\(.email))"'
+    fi
+}
+
+user_view() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo user view <username>" >&2
+        exit 1
+    fi
+
+    local result
+    result=$(api_call GET "users/$1")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "Login:    \(.login)",
+            "Name:     \(.full_name // "-")",
+            "Email:    \(.email // "-")",
+            "Admin:    \(if .is_admin then "yes" else "no" end)",
+            "Created:  \(.created[:10])"
+        '
+    fi
+}
+
+user_edit() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo user edit <username> [--email=X] [--admin=true|false] [--active=true|false]" >&2
+        exit 1
+    fi
+
+    local username="$1"
+    shift
+
+    # Fetch current user data for required fields
+    local current
+    current=$(api_call GET "users/$username")
+    local login_name source_id
+    login_name=$(echo "$current" | jq -r '.login')
+    source_id=$(echo "$current" | jq -r '.source_id // 0')
+
+    local body
+    body=$(jq -n \
+        --arg login "$login_name" \
+        --argjson source_id "$source_id" \
+        '{login_name: $login, source_id: $source_id}')
+
+    local val
+    if val=$(get_flag "--email" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {email: $v}')
+    fi
+    if val=$(get_flag "--admin" "$@" 2>/dev/null); then
+        if [[ "$val" == "true" ]]; then
+            body=$(echo "$body" | jq '. + {site_admin: true}')
+        else
+            body=$(echo "$body" | jq '. + {site_admin: false}')
+        fi
+    fi
+    if val=$(get_flag "--active" "$@" 2>/dev/null); then
+        if [[ "$val" == "true" ]]; then
+            body=$(echo "$body" | jq '. + {active: true}')
+        else
+            body=$(echo "$body" | jq '. + {active: false}')
+        fi
+    fi
+
+    local result
+    result=$(api_call PATCH "admin/users/$username" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Updated user: $(echo "$result" | jq -r '.login')"
+    fi
+}
+
+user_delete() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo user delete <username> [--yes]" >&2
+        exit 1
+    fi
+    local user="$1"
+    shift
+
+    confirm_delete "user" "$user" "$@"
+    api_call DELETE "admin/users/$user" > /dev/null
+    echo "Deleted user: $user"
+}
+
+cmd_user_key() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo user key <list|add|delete> <user|--self> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list)   user_key_list "$@" ;;
+        add)    user_key_add "$@" ;;
+        delete) user_key_delete "$@" ;;
+        *)      echo "Unknown user key action: $action" >&2; exit 1 ;;
+    esac
+}
+
+user_key_list() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo user key list <user|--self>" >&2; exit 1; }
+    local target="$1"
+    local endpoint
+    if [[ "$target" == "--self" ]]; then
+        endpoint="user/keys"
+    else
+        endpoint="users/$target/keys"
+    fi
+    local result
+    result=$(api_call GET "$endpoint?limit=50")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["ID","TITLE","FINGERPRINT","CREATED"],
+            (.[] | [.id, (.title // "-"), (.fingerprint // "-"), (.created_at[:10])])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+user_key_add() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo user key add <user|--self> --title=X --key=<key-or-@file>" >&2; exit 1; }
+    local target="$1"; shift
+    local title key_arg key_content
+    title=$(get_flag "--title" "$@") || { echo "Missing --title" >&2; exit 1; }
+    key_arg=$(get_flag "--key" "$@") || { echo "Missing --key (literal or @file)" >&2; exit 1; }
+    key_content=$(read_key_arg "$key_arg")
+
+    local body
+    body=$(jq -n --arg t "$title" --arg k "$key_content" '{title: $t, key: $k, read_only: false}')
+
+    local endpoint result
+    if [[ "$target" == "--self" ]]; then
+        endpoint="user/keys"
+    else
+        endpoint="admin/users/$target/keys"
+    fi
+    result=$(api_call POST "$endpoint" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Added SSH key: \(.title) (id=\(.id))"'
+    fi
+}
+
+user_key_delete() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo user key delete <user|--self> <id> [--yes]" >&2; exit 1; }
+    local target="$1" key_id="$2"; shift 2
+    confirm_delete "SSH key" "$key_id" "$@"
+    local endpoint
+    if [[ "$target" == "--self" ]]; then
+        endpoint="user/keys/$key_id"
+    else
+        endpoint="admin/users/$target/keys/$key_id"
+    fi
+    api_call DELETE "$endpoint" > /dev/null
+    echo "Deleted SSH key: $key_id"
+}
+
+cmd_user_gpg() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo user gpg <list|add|delete> <user|--self> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list)   user_gpg_list "$@" ;;
+        add)    user_gpg_add "$@" ;;
+        delete) user_gpg_delete "$@" ;;
+        *)      echo "Unknown user gpg action: $action" >&2; exit 1 ;;
+    esac
+}
+
+user_gpg_list() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo user gpg list <user|--self>" >&2; exit 1; }
+    local target="$1"
+    local endpoint
+    if [[ "$target" == "--self" ]]; then
+        endpoint="user/gpg_keys"
+    else
+        endpoint="users/$target/gpg_keys"
+    fi
+    local result
+    result=$(api_call GET "$endpoint?limit=50")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["ID","KEY_ID","EMAILS","CREATED"],
+            (.[] | [.id, .key_id, ([.emails[]?.email] | join(",")), (.created_at[:10])])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+user_gpg_add() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo user gpg add --self --armored=<key-or-@file>" >&2; exit 1; }
+    local target="$1"; shift
+    if [[ "$target" != "--self" ]]; then
+        echo "forgejo: GPG add is self-only (no admin-on-behalf endpoint in Forgejo)." >&2
+        echo "        Run as the target user with --self." >&2
+        exit 2
+    fi
+    local arg content
+    arg=$(get_flag "--armored" "$@") || { echo "Missing --armored (literal or @file)" >&2; exit 1; }
+    content=$(read_key_arg "$arg")
+    local body
+    body=$(jq -n --arg k "$content" '{armored_public_key: $k}')
+    local result
+    result=$(api_call POST "user/gpg_keys" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Added GPG key: \(.key_id) (id=\(.id))"'
+    fi
+}
+
+user_gpg_delete() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo user gpg delete <user|--self> <id> [--yes]" >&2; exit 1; }
+    local target="$1" key_id="$2"; shift 2
+    if [[ "$target" != "--self" ]]; then
+        echo "forgejo: GPG delete is self-only (no admin-on-behalf endpoint in Forgejo)." >&2
+        exit 2
+    fi
+    confirm_delete "GPG key" "$key_id" "$@"
+    api_call DELETE "user/gpg_keys/$key_id" > /dev/null
+    echo "Deleted GPG key: $key_id"
+}
+
+cmd_user_token() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo user token <list|create|delete> <user> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list)   user_token_list "$@" ;;
+        create) user_token_create "$@" ;;
+        delete) user_token_delete "$@" ;;
+        *)      echo "Unknown user token action: $action" >&2; exit 1 ;;
+    esac
+}
+
+user_token_list() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo user token list <user>" >&2; exit 1; }
+    local user="$1"
+    local result
+    result=$(api_call_basic GET "$user" "users/$user/tokens?limit=50")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["ID","NAME","SCOPES"],
+            (.[] | [.id, .name, ((.scopes // []) | join(","))])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+user_token_create() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo user token create <user> --name=X [--scopes=read:repo,...]" >&2; exit 1; }
+    local user="$1"; shift
+    local name scopes
+    name=$(get_flag "--name" "$@") || { echo "Missing --name" >&2; exit 1; }
+    scopes=$(get_flag "--scopes" "$@" 2>/dev/null) || scopes=""
+
+    local body
+    if [[ -n "$scopes" ]]; then
+        body=$(jq -n --arg n "$name" --arg s "$scopes" \
+            '{name: $n, scopes: ($s | split(","))}')
+    else
+        body=$(jq -n --arg n "$name" '{name: $n}')
+    fi
+
+    local result
+    result=$(api_call_basic POST "$user" "users/$user/tokens" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "WARNING: token shown ONCE below — copy it now." >&2
+        echo "$result" | jq -r '"Token: \(.sha1)\nID:    \(.id)\nName:  \(.name)"'
+    fi
+}
+
+user_token_delete() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo user token delete <user> <name> [--yes]" >&2; exit 1; }
+    local user="$1" name="$2"; shift 2
+    confirm_delete "access token" "$name" "$@"
+    api_call_basic DELETE "$user" "users/$user/tokens/$name" > /dev/null
+    echo "Deleted access token: $name"
+}
+
+cmd_org() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org <list|create|view|edit|delete|member|team> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)   org_list "$@" ;;
+        create) org_create "$@" ;;
+        view)   org_view "$@" ;;
+        edit)   org_edit "$@" ;;
+        delete) org_delete "$@" ;;
+        member) cmd_org_member "$@" ;;
+        team)   cmd_org_team "$@" ;;
+        *)      echo "Unknown org action: $action" >&2; exit 1 ;;
+    esac
+}
+
+org_list() {
+    local result
+    result=$(api_call GET "admin/orgs?limit=50")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["NAME","DESCRIPTION","VISIBILITY"],
+            (.[] | [.username, (.description // "-")[:40], .visibility])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+org_create() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org create <name> [--desc=X] [--visibility=public|private]" >&2
+        exit 1
+    fi
+
+    local name="$1"
+    shift
+    local desc visibility
+
+    desc=$(get_flag "--desc" "$@" 2>/dev/null) || desc=""
+    visibility=$(get_flag "--visibility" "$@" 2>/dev/null) || visibility="public"
+
+    local body
+    body=$(jq -n \
+        --arg name "$name" \
+        --arg desc "$desc" \
+        --arg vis "$visibility" \
+        '{username: $name, description: $desc, visibility: $vis}')
+
+    local result
+    result=$(api_call POST "orgs" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created org: \(.username)"'
+    fi
+}
+
+org_view() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org view <name>" >&2
+        exit 1
+    fi
+
+    local name="$1"
+
+    local result
+    result=$(api_call GET "orgs/$name")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "Name:        \(.username)",
+            "Description: \(.description // "-")",
+            "Visibility:  \(.visibility)",
+            "Website:     \(.website // "-")"
+        '
+
+        echo ""
+        echo "--- Members ---"
+        local members
+        members=$(api_call GET "orgs/$name/members?limit=50")
+        echo "$members" | jq -r '
+            if length == 0 then "No members."
+            else .[] | "  \(.login)"
+            end
+        '
+    fi
+}
+
+org_edit() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org edit <name> [--desc=X] [--visibility=public|private]" >&2
+        exit 1
+    fi
+
+    local name="$1"
+    shift
+    local body="{}"
+
+    local val
+    if val=$(get_flag "--desc" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {description: $v}')
+    fi
+    if val=$(get_flag "--visibility" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {visibility: $v}')
+    fi
+
+    local result
+    result=$(api_call PATCH "orgs/$name" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Updated org: $(echo "$result" | jq -r '.username')"
+    fi
+}
+
+org_delete() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org delete <name> [--yes]" >&2
+        exit 1
+    fi
+    local org="$1"
+    shift
+
+    confirm_delete "org" "$org" "$@"
+    api_call DELETE "orgs/$org" > /dev/null
+    echo "Deleted org: $org"
+}
+
+cmd_org_member() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org member <list|add|remove> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list)   org_member_list "$@" ;;
+        add)    org_member_add "$@" ;;
+        remove) org_member_remove "$@" ;;
+        *)      echo "Unknown org member action: $action" >&2; exit 1 ;;
+    esac
+}
+
+org_member_list() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo org member list <org>" >&2; exit 1; }
+    local org="$1"
+    local result
+    result=$(api_call GET "orgs/$org/members?limit=50")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["LOGIN","NAME","EMAIL"],
+            (.[] | [.login, (.full_name // "-"), (.email // "-")])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+org_member_add() {
+    cat >&2 <<'EOF'
+forgejo: org members are conferred by team membership in Forgejo.
+        Use: forgejo org team member add <org> <team> --user=<user>
+EOF
+    exit 2
+}
+
+org_member_remove() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo org member remove <org> --user=<user>" >&2; exit 1; }
+    local org="$1"; shift
+    local user
+    user=$(get_flag "--user" "$@") || { echo "Missing --user" >&2; exit 1; }
+    api_call DELETE "orgs/$org/members/$user" > /dev/null
+    echo "Removed $user from org $org"
+}
+
+cmd_org_team() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org team <list|view|create|edit|delete|member|repo> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list)   org_team_list "$@" ;;
+        view)   org_team_view "$@" ;;
+        create) org_team_create "$@" ;;
+        edit)   org_team_edit "$@" ;;
+        delete) org_team_delete "$@" ;;
+        member) cmd_org_team_member "$@" ;;
+        repo)   cmd_org_team_repo "$@" ;;
+        *)      echo "Unknown org team action: $action" >&2; exit 1 ;;
+    esac
+}
+
+org_team_list() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo org team list <org>" >&2; exit 1; }
+    local org="$1"
+    local result
+    result=$(api_call GET "orgs/$org/teams?limit=50")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["ID","NAME","PERMISSION","ALL_REPOS","DESCRIPTION"],
+            (.[] | [.id, .name, .permission, (.includes_all_repositories|tostring), ((.description // "-")[:40])])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+org_team_view() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team view <org> <team>" >&2; exit 1; }
+    local org="$1" team_arg="$2"
+    local team_id
+    team_id=$(resolve_team_id "$org" "$team_arg")
+    local result
+    result=$(api_call GET "teams/$team_id")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "ID:           \(.id)",
+            "Name:         \(.name)",
+            "Description:  \(.description // "-")",
+            "Permission:   \(.permission)",
+            "Includes all: \(.includes_all_repositories)",
+            "Can create:   \(.can_create_org_repo)"
+        '
+    fi
+}
+
+org_team_create() {
+    [[ $# -ge 1 ]] || { echo "Usage: forgejo org team create <org> --name=X [--description=X] [--permission=read|write|admin]" >&2; exit 1; }
+    local org="$1"; shift
+    local name desc permission
+    name=$(get_flag "--name" "$@") || { echo "Missing --name" >&2; exit 1; }
+    desc=$(get_flag "--description" "$@" 2>/dev/null) || desc=""
+    permission=$(get_flag "--permission" "$@" 2>/dev/null) || permission="read"
+
+    local body
+    body=$(jq -n \
+        --arg n "$name" --arg d "$desc" --arg p "$permission" \
+        '{name: $n, description: $d, permission: $p,
+          includes_all_repositories: false, can_create_org_repo: false,
+          units: ["repo.code","repo.issues","repo.pulls","repo.releases","repo.wiki","repo.ext_wiki","repo.ext_issues","repo.projects"]}')
+
+    local result
+    result=$(api_call POST "orgs/$org/teams" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created team: \(.name) (id=\(.id))"'
+    fi
+}
+
+org_team_edit() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team edit <org> <team> [--name=X] [--description=X] [--permission=X]" >&2; exit 1; }
+    local org="$1" team_arg="$2"; shift 2
+    local team_id; team_id=$(resolve_team_id "$org" "$team_arg")
+
+    # PATCH requires name + permission to be sent; fetch current to fill in.
+    local current
+    current=$(api_call GET "teams/$team_id")
+    local body
+    body=$(echo "$current" | jq '{name: .name, description: .description, permission: .permission,
+                                  includes_all_repositories: .includes_all_repositories,
+                                  can_create_org_repo: .can_create_org_repo,
+                                  units: (.units // ["repo.code"])}')
+
+    local val
+    if val=$(get_flag "--name" "$@" 2>/dev/null);        then body=$(echo "$body" | jq --arg v "$val" '. + {name: $v}'); fi
+    if val=$(get_flag "--description" "$@" 2>/dev/null); then body=$(echo "$body" | jq --arg v "$val" '. + {description: $v}'); fi
+    if val=$(get_flag "--permission" "$@" 2>/dev/null);  then body=$(echo "$body" | jq --arg v "$val" '. + {permission: $v}'); fi
+
+    local result
+    result=$(api_call PATCH "teams/$team_id" "$body")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Updated team: \(.name) (id=\(.id))"'
+    fi
+}
+
+org_team_delete() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team delete <org> <team> [--yes]" >&2; exit 1; }
+    local org="$1" team_arg="$2"; shift 2
+    local team_id; team_id=$(resolve_team_id "$org" "$team_arg")
+    confirm_delete "team" "$team_arg" "$@"
+    api_call DELETE "teams/$team_id" > /dev/null
+    echo "Deleted team: $team_arg (id=$team_id)"
+}
+
+cmd_org_team_member() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org team member <list|add|remove> <org> <team> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list)   org_team_member_list "$@" ;;
+        add)    org_team_member_add "$@" ;;
+        remove) org_team_member_remove "$@" ;;
+        *)      echo "Unknown org team member action: $action" >&2; exit 1 ;;
+    esac
+}
+
+org_team_member_list() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team member list <org> <team>" >&2; exit 1; }
+    local team_id; team_id=$(resolve_team_id "$1" "$2")
+    local result
+    result=$(api_call GET "teams/$team_id/members?limit=50")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["LOGIN","NAME","EMAIL"],
+            (.[] | [.login, (.full_name // "-"), (.email // "-")])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+org_team_member_add() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team member add <org> <team> --user=<user>" >&2; exit 1; }
+    local org="$1" team_arg="$2"; shift 2
+    local user; user=$(get_flag "--user" "$@") || { echo "Missing --user" >&2; exit 1; }
+    local team_id; team_id=$(resolve_team_id "$org" "$team_arg")
+    api_call PUT "teams/$team_id/members/$user" > /dev/null
+    echo "Added $user to team $team_arg (id=$team_id)"
+}
+
+org_team_member_remove() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team member remove <org> <team> --user=<user>" >&2; exit 1; }
+    local org="$1" team_arg="$2"; shift 2
+    local user; user=$(get_flag "--user" "$@") || { echo "Missing --user" >&2; exit 1; }
+    local team_id; team_id=$(resolve_team_id "$org" "$team_arg")
+    api_call DELETE "teams/$team_id/members/$user" > /dev/null
+    echo "Removed $user from team $team_arg (id=$team_id)"
+}
+
+cmd_org_team_repo() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo org team repo <list|add|remove> <org> <team> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list)   org_team_repo_list "$@" ;;
+        add)    org_team_repo_add "$@" ;;
+        remove) org_team_repo_remove "$@" ;;
+        *)      echo "Unknown org team repo action: $action" >&2; exit 1 ;;
+    esac
+}
+
+org_team_repo_list() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team repo list <org> <team>" >&2; exit 1; }
+    local team_id; team_id=$(resolve_team_id "$1" "$2")
+    local result
+    result=$(api_call GET "teams/$team_id/repos?limit=50")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            ["FULL_NAME","PRIVATE","ARCHIVED"],
+            (.[] | [.full_name, (.private|tostring), (.archived|tostring)])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+org_team_repo_add() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team repo add <org> <team> --repo=<owner/repo>" >&2; exit 1; }
+    local org="$1" team_arg="$2"; shift 2
+    local fullname; fullname=$(get_flag "--repo" "$@") || { echo "Missing --repo (expected owner/repo)" >&2; exit 1; }
+    local team_id; team_id=$(resolve_team_id "$org" "$team_arg")
+    api_call PUT "teams/$team_id/repos/$fullname" > /dev/null
+    echo "Added $fullname to team $team_arg (id=$team_id)"
+}
+
+org_team_repo_remove() {
+    [[ $# -ge 2 ]] || { echo "Usage: forgejo org team repo remove <org> <team> --repo=<owner/repo>" >&2; exit 1; }
+    local org="$1" team_arg="$2"; shift 2
+    local fullname; fullname=$(get_flag "--repo" "$@") || { echo "Missing --repo" >&2; exit 1; }
+    local team_id; team_id=$(resolve_team_id "$org" "$team_arg")
+    api_call DELETE "teams/$team_id/repos/$fullname" > /dev/null
+    echo "Removed $fullname from team $team_arg (id=$team_id)"
+}
+
+# --- ACTIONS COMMANDS ---
+
+cmd_actions() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo actions <list|view|watch|logs|runner|workflow|secret|variable> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)     actions_list "$@" ;;
+        view)     actions_view "$@" ;;
+        watch)    actions_watch "$@" ;;
+        logs)     actions_logs "$@" ;;
+        runner)   cmd_actions_runner "$@" ;;
+        workflow) cmd_actions_workflow "$@" ;;
+        secret)   cmd_actions_secret "$@" ;;
+        variable) cmd_actions_variable "$@" ;;
+        *)        echo "Unknown actions command: $action" >&2; exit 1 ;;
+    esac
+}
+
+actions_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo actions list <owner/repo>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local result
+    result=$(api_call GET "repos/$repo/actions/runs?limit=20")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            .workflow_runs // [] |
+            (["ID","STATUS","EVENT","BRANCH","COMMIT","STARTED","TITLE"] | @tsv),
+            (.[] | [
+                (.id|tostring),
+                (.status // "-"),
+                (.event // "-"),
+                (.prettyref // "-"),
+                (.commit_sha // "-")[:12],
+                ((.started // .created // "-") | if . != "-" then .[:19] else . end),
+                (.title // "-")[:50]
+            ] | @tsv)
+        ' | column -t -s $'\t'
+    fi
+}
+
+actions_view() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo actions view <owner/repo> <run_id>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local run_id="$2"
+
+    local result
+    result=$(api_call GET "repos/$repo/actions/runs/$run_id")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "Run #\(.id)",
+            "Title:      \(.title // "-")",
+            "Status:     \(.status // "-")",
+            "Event:      \(.event // "-")",
+            "Branch:     \(.prettyref // "-")",
+            "Commit:     \(.commit_sha // "-" | .[:12])",
+            "Started:    \(.started // .created // "-")",
+            "Stopped:    \(.stopped // "-")",
+            "Duration:   \(if .duration then "\(.duration / 1000000000 | floor)s" else "-" end)",
+            "Trigger:    \(.trigger_user.login // "-")"
+        '
+
+        # Get jobs (tasks) for this run via index_in_repo
+        local run_index
+        run_index=$(echo "$result" | jq -r '.index_in_repo')
+
+        echo ""
+        echo "--- Jobs ---"
+        local tasks
+        tasks=$(api_call GET "repos/$repo/actions/tasks?limit=200")
+        echo "$tasks" | jq -r --argjson idx "$run_index" '
+            .workflow_runs // [] | map(select(.run_number == $idx)) |
+            if length == 0 then "No jobs found."
+            else .[] |
+                "  [\(.status)] \(.name) (task_id=\(.id))"
+            end
+        '
+    fi
+}
+
+actions_watch() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo actions watch <owner/repo> <run_id>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local run_id="$2"
+
+    echo "Watching run #$run_id..."
+    while true; do
+        local result
+        result=$(api_call GET "repos/$repo/actions/runs/$run_id")
+        local status
+        status=$(echo "$result" | jq -r '.status')
+        local title
+        title=$(echo "$result" | jq -r '.title // "-"')
+
+        printf "\r%-80s" "[$status] $title"
+
+        if [[ "$status" == "success" || "$status" == "failure" || "$status" == "cancelled" ]]; then
+            echo ""
+            if [[ "$status" == "success" ]]; then
+                echo "Run completed successfully."
+            else
+                echo "Run finished: $status"
+                exit 1
+            fi
+            break
+        fi
+        sleep 5
+    done
+}
+
+actions_logs() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo actions logs <owner/repo> <run_id>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local run_id="$2"
+
+    local run run_index tasks task_data count
+    run=$(api_call GET "repos/$repo/actions/runs/$run_id")
+    run_index=$(echo "$run" | jq -r '.index_in_repo')
+    tasks=$(api_call GET "repos/$repo/actions/tasks?limit=200")
+    task_data=$(echo "$tasks" | jq -c --argjson idx "$run_index" '
+        .workflow_runs // [] | map(select(.run_number == $idx))
+    ')
+    count=$(echo "$task_data" | jq 'length')
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "No jobs found for run #$run_id" >&2
+        exit 1
+    fi
+
+    # When FORGEJO_LOG_PATH is set in config (i.e. when running on the Forgejo
+    # host), read zstd-compressed task logs directly from disk. Layout is
+    # <FORGEJO_LOG_PATH>/<owner>/<repo>/<last-2-hex-of-task_id>/<task_id>.log.zst
+    if [[ -n "$FORGEJO_LOG_PATH" ]]; then
+        command -v zstd >/dev/null || {
+            echo "FORGEJO_LOG_PATH is set but zstd is not installed" >&2
+            exit 1
+        }
+        local i=0 task_id task_name task_status shard log_path
+        while [[ $i -lt $count ]]; do
+            task_id=$(echo "$task_data" | jq -r ".[$i].id")
+            task_name=$(echo "$task_data" | jq -r ".[$i].name")
+            task_status=$(echo "$task_data" | jq -r ".[$i].status")
+            shard=$(printf '%02x' "$((task_id & 0xff))")
+            log_path="$FORGEJO_LOG_PATH/$repo/$shard/$task_id.log.zst"
+            echo "=== Job: $task_name (task_id=$task_id, status=$task_status) ==="
+            if [[ -f "$log_path" ]]; then
+                zstd -dc "$log_path"
+            else
+                echo "(log not on disk: $log_path)"
+            fi
+            echo ""
+            i=$((i+1))
+        done
+        return 0
+    fi
+
+    echo "$task_data" | jq -r '.[] | "  [\(.status)] \(.name) (task_id=\(.id))"'
+    echo ""
+    echo "Note: Forgejo's API does not expose job logs (probed on Gitea 1.22 / Forgejo 15.0.2)."
+    echo "  - View in browser: ${FORGEJO_URL}/$repo/actions/runs/$run_index"
+    echo "  - On the Forgejo host, set FORGEJO_LOG_PATH in ~/.config/forgejo-cli/config"
+    echo "    (e.g. FORGEJO_LOG_PATH=/srv/forgejo/data/gitea/actions_log) to read from disk."
+}
+
+# Resolves the API path prefix for a runner/secret/variable subcommand from
+# scope tokens in the args. Returns one of:
+#   admin/actions                       (--admin flag present)
+#   repos/<owner>/<repo>/actions        (first positional contains '/')
+#   orgs/<owner>/actions                (first positional has no '/')
+actions_scope_path() {
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == "--admin" ]]; then
+            printf '%s\n' "admin/actions"
+            return 0
+        fi
+    done
+    for arg in "$@"; do
+        [[ "$arg" == --* ]] && continue
+        if [[ "$arg" == */* ]]; then
+            printf '%s\n' "repos/$arg/actions"
+        else
+            printf '%s\n' "orgs/$arg/actions"
+        fi
+        return 0
+    done
+    echo "Missing scope: expected <owner/repo>, <org>, or --admin" >&2
+    return 1
+}
+
+# Returns the positional args (one per line) after dropping the scope token:
+#   --admin                         -> drop only --admin
+#   first positional (no --admin)   -> drop that positional
+# Other flags (--json, --yes, etc.) are also dropped so callers can pick
+# subsequent positionals (e.g. runner_id, secret name) cleanly.
+actions_scope_skip_args() {
+    local has_admin=0 arg
+    for arg in "$@"; do
+        [[ "$arg" == "--admin" ]] && { has_admin=1; break; }
+    done
+
+    local skipped=0 result=()
+    for arg in "$@"; do
+        [[ "$arg" == "--admin" ]] && continue
+        [[ "$arg" == --* ]] && continue
+        if [[ $has_admin -eq 0 && $skipped -eq 0 ]]; then
+            skipped=1
+            continue
+        fi
+        result+=("$arg")
+    done
+    if [[ ${#result[@]} -gt 0 ]]; then
+        printf '%s\n' "${result[@]}"
+    fi
+}
+
+cmd_actions_runner() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo actions runner <list|register|delete> [args]" >&2
+        exit 1
+    fi
+    local sub="$1"; shift
+    case "$sub" in
+        list)     actions_runner_list "$@" ;;
+        register) actions_runner_register "$@" ;;
+        delete)   actions_runner_delete "$@" ;;
+        *) echo "Unknown actions runner command: $sub" >&2; exit 1 ;;
+    esac
+}
+
+actions_runner_list() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local result
+    result=$(api_call GET "$scope/runners")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            (if type == "array" then . else (.runners // []) end) as $rs |
+            (["ID","NAME","STATUS","LABELS","VERSION"] | @tsv),
+            ($rs[] | [
+                (.id|tostring),
+                (.name // "-"),
+                (.status // "-"),
+                ((.labels // []) | join(",") | if . == "" then "-" else . end),
+                (.version // "-")
+            ] | @tsv)
+        ' | column -t -s $'\t'
+    fi
+}
+
+actions_runner_register() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local result
+    result=$(api_call GET "$scope/runners/registration-token")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '.token // empty'
+    fi
+}
+
+actions_runner_delete() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local rest=()
+    mapfile -t rest < <(actions_scope_skip_args "$@")
+    local runner_id="${rest[0]:-}"
+    if [[ -z "$runner_id" ]]; then
+        echo "Usage: forgejo actions runner delete <owner/repo|org|--admin> <runner_id> [--yes]" >&2
+        exit 1
+    fi
+    confirm_delete "runner" "$runner_id" "$@"
+    api_call DELETE "$scope/runners/$runner_id" >/dev/null
+    echo "Deleted runner $runner_id"
+}
+
+cmd_actions_workflow() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo actions workflow <list|dispatch> [args]" >&2
+        exit 1
+    fi
+    local sub="$1"; shift
+    case "$sub" in
+        list)     actions_workflow_list "$@" ;;
+        dispatch) actions_workflow_dispatch "$@" ;;
+        *) echo "Unknown actions workflow command: $sub" >&2; exit 1 ;;
+    esac
+}
+
+# Lists workflow files in the repo. Forgejo's API has no direct endpoint,
+# so this reads the repo's .gitea/workflows/ (preferred) or .github/workflows/
+# directory via the contents endpoint.
+actions_workflow_list() {
+    local repo="${1:-}"
+    if [[ -z "$repo" ]]; then
+        echo "Usage: forgejo actions workflow list <owner/repo>" >&2
+        exit 1
+    fi
+    local path result items
+    for path in ".forgejo/workflows" ".gitea/workflows" ".github/workflows"; do
+        result=$(api_call GET "repos/$repo/contents/$path" 2>/dev/null) || continue
+        items=$(echo "$result" | jq -r --arg p "$path" '
+            map(select(.type == "file" and (.name | test("\\.(yml|yaml)$")))) |
+            if length == 0 then empty
+            else .[] | "\(.name)\t\($p)/\(.name)" end
+        ')
+        if [[ -n "$items" ]]; then
+            if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+                echo "$result" | jq '[.[] | select(.type == "file" and (.name | test("\\.(yml|yaml)$"))) | {name, path}]'
+            else
+                { printf 'NAME\tPATH\n'; echo "$items"; } | column -t -s $'\t'
+            fi
+            return 0
+        fi
+    done
+    echo "No workflows found in .forgejo/workflows, .gitea/workflows or .github/workflows of $repo" >&2
+    exit 1
+}
+
+actions_workflow_dispatch() {
+    local repo="${1:-}"
+    local workflow ref
+    workflow=$(get_flag "--workflow" "$@" 2>/dev/null) || workflow=""
+    ref=$(get_flag "--ref" "$@" 2>/dev/null) || ref=""
+    if [[ -z "$repo" || -z "$workflow" || -z "$ref" ]]; then
+        echo "Usage: forgejo actions workflow dispatch <owner/repo> --workflow=X --ref=Y [--input=k=v]..." >&2
+        exit 1
+    fi
+    local inputs_json="{}" arg
+    for arg in "$@"; do
+        if [[ "$arg" == --input=* ]]; then
+            local kv="${arg#--input=}"
+            local k="${kv%%=*}"
+            local v="${kv#*=}"
+            if [[ "$k" == "$kv" ]]; then
+                echo "Invalid --input (expected k=v): $arg" >&2
+                exit 1
+            fi
+            inputs_json=$(echo "$inputs_json" | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')
+        fi
+    done
+    local body
+    body=$(jq -n --arg ref "$ref" --argjson inputs "$inputs_json" '{ref:$ref, inputs:$inputs}')
+    api_call POST "repos/$repo/actions/workflows/$workflow/dispatches" "$body" >/dev/null
+    echo "Dispatched $workflow on $ref"
+}
+
+cmd_actions_secret() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo actions secret <list|set|delete> [args]" >&2
+        exit 1
+    fi
+    local sub="$1"; shift
+    case "$sub" in
+        list)   actions_secret_list "$@" ;;
+        set)    actions_secret_set "$@" ;;
+        delete) actions_secret_delete "$@" ;;
+        *) echo "Unknown actions secret command: $sub" >&2; exit 1 ;;
+    esac
+}
+
+actions_secret_list() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local result
+    result=$(api_call GET "$scope/secrets")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            . // [] |
+            (["NAME","CREATED"] | @tsv),
+            (.[] | [
+                (.name // "-"),
+                ((.created_at // "-") | if . != "-" then .[:19] else . end)
+            ] | @tsv)
+        ' | column -t -s $'\t'
+    fi
+}
+
+actions_secret_set() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local name value
+    name=$(get_flag "--name" "$@" 2>/dev/null) || name=""
+    value=$(get_flag "--value" "$@" 2>/dev/null) || value=""
+    if [[ -z "$name" || -z "$value" ]]; then
+        echo "Usage: forgejo actions secret set <owner/repo|org> --name=X --value=X" >&2
+        exit 1
+    fi
+    local body
+    body=$(jq -n --arg v "$value" '{data:$v}')
+    local out status
+    out=$(api_call_status PUT "$scope/secrets/$name" "$body")
+    status=$(echo "$out" | head -1)
+    if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+        echo "Failed to set secret (HTTP $status):" >&2
+        echo "$out" | tail -n +2 >&2
+        exit 1
+    fi
+    echo "Set secret $name"
+}
+
+actions_secret_delete() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local rest=()
+    mapfile -t rest < <(actions_scope_skip_args "$@")
+    local name="${rest[0]:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: forgejo actions secret delete <owner/repo|org> <name> [--yes]" >&2
+        exit 1
+    fi
+    confirm_delete "secret" "$name" "$@"
+    api_call DELETE "$scope/secrets/$name" >/dev/null
+    echo "Deleted secret $name"
+}
+
+cmd_actions_variable() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo actions variable <list|set|delete> [args]" >&2
+        exit 1
+    fi
+    local sub="$1"; shift
+    case "$sub" in
+        list)   actions_variable_list "$@" ;;
+        set)    actions_variable_set "$@" ;;
+        delete) actions_variable_delete "$@" ;;
+        *) echo "Unknown actions variable command: $sub" >&2; exit 1 ;;
+    esac
+}
+
+actions_variable_list() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local result
+    result=$(api_call GET "$scope/variables")
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            . // [] |
+            (["NAME","VALUE"] | @tsv),
+            (.[] | [
+                (.name // "-"),
+                (.data // "-")
+            ] | @tsv)
+        ' | column -t -s $'\t'
+    fi
+}
+
+# Idempotent set: GET first to decide POST (create) vs PUT (update). The
+# create body field is "value"; update body uses "value" too. The response
+# uses "data" for the same field.
+actions_variable_set() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local name value
+    name=$(get_flag "--name" "$@" 2>/dev/null) || name=""
+    value=$(get_flag "--value" "$@" 2>/dev/null) || value=""
+    if [[ -z "$name" || -z "$value" ]]; then
+        echo "Usage: forgejo actions variable set <owner/repo|org> --name=X --value=X" >&2
+        exit 1
+    fi
+    local body
+    body=$(jq -n --arg v "$value" '{value:$v}')
+    local probe status
+    probe=$(api_call_status GET "$scope/variables/$name")
+    status=$(echo "$probe" | head -1)
+    local out write_status
+    if [[ "$status" -ge 200 && "$status" -lt 300 ]]; then
+        out=$(api_call_status PUT "$scope/variables/$name" "$body")
+        write_status=$(echo "$out" | head -1)
+        if [[ "$write_status" -lt 200 || "$write_status" -ge 300 ]]; then
+            echo "Failed to update variable (HTTP $write_status):" >&2
+            echo "$out" | tail -n +2 >&2
+            exit 1
+        fi
+        echo "Updated variable $name"
+    else
+        out=$(api_call_status POST "$scope/variables/$name" "$body")
+        write_status=$(echo "$out" | head -1)
+        if [[ "$write_status" -lt 200 || "$write_status" -ge 300 ]]; then
+            echo "Failed to create variable (HTTP $write_status):" >&2
+            echo "$out" | tail -n +2 >&2
+            exit 1
+        fi
+        echo "Created variable $name"
+    fi
+}
+
+actions_variable_delete() {
+    local scope
+    scope=$(actions_scope_path "$@") || exit 1
+    local rest=()
+    mapfile -t rest < <(actions_scope_skip_args "$@")
+    local name="${rest[0]:-}"
+    if [[ -z "$name" ]]; then
+        echo "Usage: forgejo actions variable delete <owner/repo|org> <name> [--yes]" >&2
+        exit 1
+    fi
+    confirm_delete "variable" "$name" "$@"
+    api_call DELETE "$scope/variables/$name" >/dev/null
+    echo "Deleted variable $name"
+}
+
+# --- PR COMMANDS ---
+
+cmd_pr() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo pr <list|create|view|merge|close|edit|ready|comment|diff|files|checks|review|requested-reviewers> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)   pr_list "$@" ;;
+        create) pr_create "$@" ;;
+        view)   pr_view "$@" ;;
+        merge)  pr_merge "$@" ;;
+        close)                pr_close "$@" ;;
+        edit)                 pr_edit "$@" ;;
+        ready)                pr_ready "$@" ;;
+        comment)              pr_comment "$@" ;;
+        diff)                 pr_diff "$@" ;;
+        files)                pr_files "$@" ;;
+        checks)               pr_checks "$@" ;;
+        review)               pr_review "$@" ;;
+        requested-reviewers)  pr_requested_reviewers "$@" ;;
+        *)      echo "Unknown pr action: $action" >&2; exit 1 ;;
+    esac
+}
+
+pr_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo pr list <owner/repo> [--state=open|closed|all]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    shift
+    local state
+    state=$(get_flag "--state" "$@" 2>/dev/null) || state="open"
+
+    local result
+    result=$(api_call GET "repos/$repo/pulls?state=$state&limit=50")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+            echo "No pull requests found."
+        else
+            echo "$result" | jq -r '
+                ["#","TITLE","STATE","AUTHOR","BASE","HEAD","UPDATED"],
+                (.[] | [
+                    (.number|tostring),
+                    .title[:50],
+                    .state,
+                    .user.login,
+                    .base.ref,
+                    .head.ref,
+                    .updated_at[:10]
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
+pr_create() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo pr create <owner/repo> --title=X --head=X [--base=main] [--body=X]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    shift
+
+    local title head base body_text
+    title=$(get_flag "--title" "$@" 2>/dev/null) || { echo "Missing --title" >&2; exit 1; }
+    head=$(get_flag "--head" "$@" 2>/dev/null) || { echo "Missing --head" >&2; exit 1; }
+    base=$(get_flag "--base" "$@" 2>/dev/null) || base="main"
+    body_text=$(get_flag "--body" "$@" 2>/dev/null) || body_text=""
+
+    local body
+    body=$(jq -n \
+        --arg title "$title" \
+        --arg head "$head" \
+        --arg base "$base" \
+        --arg body "$body_text" \
+        '{title: $title, head: $head, base: $base, body: $body}')
+
+    local result
+    result=$(api_call POST "repos/$repo/pulls" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created PR #\(.number): \(.title)\nURL: \(.html_url)"'
+    fi
+}
+
+pr_view() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr view <owner/repo> <number>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local number="$2"
+
+    local result
+    result=$(api_call GET "repos/$repo/pulls/$number")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "#\(.number): \(.title)",
+            "State:      \(.state)",
+            "Author:     \(.user.login)",
+            "Base:       \(.base.ref) ← Head: \(.head.ref)",
+            "Mergeable:  \(.mergeable // "-")",
+            "Created:    \(.created_at[:10])",
+            "Updated:    \(.updated_at[:10])",
+            "Labels:     \(if (.labels | length) > 0 then ([.labels[].name] | join(", ")) else "-" end)",
+            "",
+            (.body // "(no body)")
+        '
+
+        echo ""
+        echo "--- Reviews ---"
+        local reviews
+        reviews=$(api_call GET "repos/$repo/pulls/$number/reviews")
+        echo "$reviews" | jq -r '
+            if length == 0 then "No reviews."
+            else .[] | "  \(.user.login): \(.state) (\(.submitted_at[:10] // "-"))"
+            end
+        '
+    fi
+}
+
+pr_merge() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr merge <owner/repo> <number> [--method=merge|rebase|squash]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local number="$2"
+    shift 2
+
+    local method
+    method=$(get_flag "--method" "$@" 2>/dev/null) || method="merge"
+
+    local body
+    body=$(jq -n --arg method "$method" '{Do: $method}')
+
+    local result
+    result=$(api_call POST "repos/$repo/pulls/$number/merge" "$body")
+
+    echo "Merged PR #$number (method: $method)"
+}
+
+pr_close() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr close <owner/repo> <number>" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+
+    local body
+    body=$(jq -n '{state: "closed"}')
+    api_call PATCH "repos/$repo/pulls/$number" "$body" > /dev/null
+    echo "Closed PR #$number"
+}
+
+pr_edit() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr edit <owner/repo> <number> [--title=X] [--body=X] [--base=X]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    shift 2
+
+    local body="{}"
+    local val
+
+    if val=$(get_flag "--title" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {title: $v}')
+    fi
+    if val=$(get_flag "--body" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {body: $v}')
+    fi
+    if val=$(get_flag "--base" "$@" 2>/dev/null); then
+        body=$(echo "$body" | jq --arg v "$val" '. + {base: $v}')
+    fi
+
+    if [[ "$body" == "{}" ]]; then
+        echo "No fields to update. Provide --title, --body, or --base." >&2
+        exit 1
+    fi
+
+    local result
+    result=$(api_call PATCH "repos/$repo/pulls/$number" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Updated PR #\(.number): \(.title)"'
+    fi
+}
+
+pr_ready() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr ready <owner/repo> <number>" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+
+    local body
+    body=$(jq -n '{draft: false}')
+    api_call PATCH "repos/$repo/pulls/$number" "$body" > /dev/null
+    echo "Marked PR #$number ready for review"
+}
+
+pr_comment() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr comment <owner/repo> <number> --body=X" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    shift 2
+
+    local body_text
+    body_text=$(get_flag "--body" "$@" 2>/dev/null) || { echo "Missing --body" >&2; exit 1; }
+
+    local body
+    body=$(jq -n --arg b "$body_text" '{body: $b}')
+
+    local result
+    result=$(api_call POST "repos/$repo/issues/$number/comments" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "Comment added to PR #$number"
+    fi
+}
+
+pr_files() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr files <owner/repo> <number>" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+
+    local result
+    result=$(api_call GET "repos/$repo/pulls/$number/files?limit=50")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+            echo "No files changed."
+        else
+            echo "$result" | jq -r '
+                ["STATUS","FILE","+ADD","-DEL"],
+                (.[] | [
+                    .status,
+                    .filename,
+                    (.additions|tostring),
+                    (.deletions|tostring)
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
+pr_diff() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr diff <owner/repo> <number>" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+
+    api_call_raw GET "repos/$repo/pulls/$number.diff"
+}
+
+pr_checks() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr checks <owner/repo> <number>" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+
+    local sha
+    sha=$(api_call GET "repos/$repo/pulls/$number" | jq -r '.head.sha')
+
+    if [[ -z "$sha" || "$sha" == "null" ]]; then
+        echo "Could not resolve head SHA for PR #$number" >&2
+        exit 1
+    fi
+
+    local statuses runs
+    statuses=$(api_call GET "repos/$repo/commits/$sha/statuses")
+    runs=$(api_call GET "repos/$repo/actions/runs?head_sha=$sha" 2>/dev/null) || runs='{"workflow_runs":[]}'
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        jq -n --argjson s "$statuses" --argjson r "$runs" \
+            '{statuses: $s, actions: ($r.workflow_runs // [])}'
+        return
+    fi
+
+    local merged
+    merged=$(jq -n --argjson s "$statuses" --argjson r "$runs" '
+        ($s | map({source:"status", name:(.context // "-"), status:.status, url:(.target_url // "-")})) +
+        (($r.workflow_runs // []) | map({source:"action", name:(.name // "-"), status:(.conclusion // .status // "-"), url:(.html_url // "-")}))
+    ')
+
+    if echo "$merged" | jq -e 'length == 0' > /dev/null 2>&1; then
+        echo "No checks found for PR #$number (head $sha)."
+    else
+        echo "$merged" | jq -r '
+            ["SOURCE","NAME","STATUS","URL"],
+            (.[] | [.source, .name, .status, .url])
+            | @tsv
+        ' | column -t -s $'\t'
+    fi
+}
+
+pr_review() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo pr review <owner/repo> <number> --approve|--request-changes|--comment [--body=X]" >&2
+        echo "       forgejo pr review list <owner/repo> <number>" >&2
+        echo "       forgejo pr review dismiss <owner/repo> <number> <review_id> --message=X" >&2
+        exit 1
+    fi
+
+    case "$1" in
+        list)    shift; pr_review_list "$@" ;;
+        dismiss) shift; pr_review_dismiss "$@" ;;
+        *)       pr_review_create "$@" ;;
+    esac
+}
+
+pr_review_create() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr review <owner/repo> <number> --approve|--request-changes|--comment [--body=X]" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    shift 2
+
+    local count=0
+    local event=""
+    if has_flag "--approve" "$@";         then event="APPROVED";        count=$((count+1)); fi
+    if has_flag "--request-changes" "$@"; then event="REQUEST_CHANGES"; count=$((count+1)); fi
+    if has_flag "--comment" "$@";         then event="COMMENT";         count=$((count+1)); fi
+
+    if [[ $count -eq 0 ]]; then
+        echo "Specify exactly one of --approve|--request-changes|--comment" >&2
+        exit 1
+    fi
+    if [[ $count -gt 1 ]]; then
+        echo "--approve, --request-changes, --comment are mutually exclusive" >&2
+        exit 1
+    fi
+
+    local body_text=""
+    body_text=$(get_flag "--body" "$@" 2>/dev/null) || body_text=""
+
+    if [[ "$event" == "REQUEST_CHANGES" && -z "$body_text" ]]; then
+        echo "--body required with --request-changes" >&2
+        exit 1
+    fi
+    if [[ "$event" == "COMMENT" && -z "$body_text" ]]; then
+        echo "--body required with --comment" >&2
+        exit 1
+    fi
+
+    local body
+    if [[ -n "$body_text" ]]; then
+        body=$(jq -n --arg e "$event" --arg b "$body_text" '{event: $e, body: $b}')
+    else
+        body=$(jq -n --arg e "$event" '{event: $e}')
+    fi
+
+    local result
+    result=$(api_call POST "repos/$repo/pulls/$number/reviews" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        local rid state
+        rid=$(echo "$result" | jq -r .id)
+        state=$(echo "$result" | jq -r .state)
+        echo "Submitted review #$rid on PR #$number (state: $state)"
+    fi
+}
+
+pr_review_list() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr review list <owner/repo> <number>" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+
+    local result
+    result=$(api_call GET "repos/$repo/pulls/$number/reviews")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+            echo "No reviews."
+        else
+            echo "$result" | jq -r '
+                ["ID","USER","STATE","SUBMITTED"],
+                (.[] | [
+                    (.id|tostring),
+                    .user.login,
+                    (.state // "-"),
+                    ((.submitted_at // "-")[:10])
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
+pr_review_dismiss() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: forgejo pr review dismiss <owner/repo> <number> <review_id> --message=X" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    local rid="$3"
+    shift 3
+
+    local msg
+    msg=$(get_flag "--message" "$@" 2>/dev/null) || { echo "Missing --message" >&2; exit 1; }
+
+    local body
+    body=$(jq -n --arg m "$msg" '{message: $m}')
+
+    api_call POST "repos/$repo/pulls/$number/reviews/$rid/dismissals" "$body" > /dev/null
+    echo "Dismissed review #$rid on PR #$number"
+}
+
+pr_requested_reviewers() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo pr requested-reviewers <add|remove> <owner/repo> <number> --users=u1,u2" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        add)    pr_requested_reviewers_add "$@" ;;
+        remove) pr_requested_reviewers_remove "$@" ;;
+        *)      echo "Unknown requested-reviewers action: $action" >&2; exit 1 ;;
+    esac
+}
+
+pr_requested_reviewers_add() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr requested-reviewers add <owner/repo> <number> --users=u1,u2" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    shift 2
+
+    local users
+    users=$(get_flag "--users" "$@" 2>/dev/null) || { echo "Missing --users" >&2; exit 1; }
+
+    local users_json
+    users_json=$(echo "$users" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+
+    local body
+    body=$(jq -nc --argjson r "$users_json" '{reviewers: $r}')
+
+    api_call POST "repos/$repo/pulls/$number/requested_reviewers" "$body" > /dev/null
+    echo "Requested reviewers added to PR #$number: $users"
+}
+
+pr_requested_reviewers_remove() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo pr requested-reviewers remove <owner/repo> <number> --users=u1,u2" >&2
+        exit 1
+    fi
+    local repo="$1"
+    local number="$2"
+    shift 2
+
+    local users
+    users=$(get_flag "--users" "$@" 2>/dev/null) || { echo "Missing --users" >&2; exit 1; }
+
+    local users_json
+    users_json=$(echo "$users" | jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+
+    local body
+    body=$(jq -nc --argjson r "$users_json" '{reviewers: $r}')
+
+    api_call DELETE "repos/$repo/pulls/$number/requested_reviewers" "$body" > /dev/null
+    echo "Requested reviewers removed from PR #$number: $users"
+}
+
+# --- RELEASE COMMANDS ---
+
+cmd_release() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo release <list|create|view|edit|delete|upload-asset|asset> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)   release_list "$@" ;;
+        create) release_create "$@" ;;
+        view)   release_view "$@" ;;
+        edit)   release_edit "$@" ;;
+        delete) release_delete "$@" ;;
+        upload-asset) release_upload_asset "$@" ;;
+        asset)  cmd_release_asset "$@" ;;
+        *)      echo "Unknown release action: $action" >&2; exit 1 ;;
+    esac
+}
+
+release_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo release list <owner/repo>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local result
+    result=$(api_call GET "repos/$repo/releases?limit=20")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+            echo "No releases found."
+        else
+            echo "$result" | jq -r '
+                ["TAG","TITLE","DRAFT","PRERELEASE","PUBLISHED"],
+                (.[] | [
+                    .tag_name,
+                    .name[:40],
+                    (if .draft then "yes" else "no" end),
+                    (if .prerelease then "yes" else "no" end),
+                    (.published_at // .created_at)[:10]
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
+release_create() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo release create <owner/repo> --tag=X --title=X [--body=X] [--draft] [--prerelease]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    shift
+
+    local tag title body_text
+    tag=$(get_flag "--tag" "$@" 2>/dev/null) || { echo "Missing --tag" >&2; exit 1; }
+    title=$(get_flag "--title" "$@" 2>/dev/null) || { echo "Missing --title" >&2; exit 1; }
+    body_text=$(get_flag "--body" "$@" 2>/dev/null) || body_text=""
+
+    local draft="false"
+    local prerelease="false"
+    has_flag "--draft" "$@" && draft="true"
+    has_flag "--prerelease" "$@" && prerelease="true"
+
+    local body
+    body=$(jq -n \
+        --arg tag "$tag" \
+        --arg name "$title" \
+        --arg body "$body_text" \
+        --argjson draft "$draft" \
+        --argjson prerelease "$prerelease" \
+        '{tag_name: $tag, name: $name, body: $body, draft: $draft, prerelease: $prerelease}')
+
+    local result
+    result=$(api_call POST "repos/$repo/releases" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created release: \(.name) (\(.tag_name))\nURL: \(.html_url // "-")"'
+    fi
+}
+
+# Resolves a release ID from a tag name. Exits non-zero (via api_call) if the
+# tag has no release. Used by edit, upload-asset, asset list, asset delete.
+resolve_release_id() {
+    local repo="$1"
+    local tag="$2"
+    api_call GET "repos/$repo/releases/tags/$tag" | jq -r '.id'
+}
+
+release_view() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo release view <owner/repo> <tag>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local tag="$2"
+    local result
+    result=$(api_call GET "repos/$repo/releases/tags/$tag")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "Tag:        \(.tag_name)",
+            "Title:      \(.name)",
+            "Draft:      \(if .draft then "yes" else "no" end)",
+            "Prerelease: \(if .prerelease then "yes" else "no" end)",
+            "Target:     \(.target_commitish)",
+            "Published:  \(.published_at // .created_at)",
+            "Author:     \(.author.login // "-")",
+            "URL:        \(.html_url // "-")",
+            "",
+            (.body // "(no body)")
+        '
+    fi
+}
+
+release_edit() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo release edit <owner/repo> <tag> [--title=X] [--body=X] [--draft|--no-draft] [--prerelease|--no-prerelease]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local tag="$2"
+    shift 2
+
+    local title body_text
+    title=$(get_flag "--title" "$@" 2>/dev/null) || title=""
+    body_text=$(get_flag "--body" "$@" 2>/dev/null) || body_text=""
+
+    local draft=""
+    if has_flag "--draft" "$@" && has_flag "--no-draft" "$@"; then
+        echo "Provide --draft OR --no-draft, not both" >&2; exit 1
+    fi
+    has_flag "--draft" "$@" && draft="true"
+    has_flag "--no-draft" "$@" && draft="false"
+
+    local prerelease=""
+    if has_flag "--prerelease" "$@" && has_flag "--no-prerelease" "$@"; then
+        echo "Provide --prerelease OR --no-prerelease, not both" >&2; exit 1
+    fi
+    has_flag "--prerelease" "$@" && prerelease="true"
+    has_flag "--no-prerelease" "$@" && prerelease="false"
+
+    if [[ -z "$title" && -z "$body_text" && -z "$draft" && -z "$prerelease" ]]; then
+        echo "Nothing to edit (supply --title, --body, --draft/--no-draft, or --prerelease/--no-prerelease)" >&2
+        exit 1
+    fi
+
+    local release_id
+    release_id=$(resolve_release_id "$repo" "$tag")
+
+    local body
+    body=$(jq -n \
+        --arg title "$title" \
+        --arg body "$body_text" \
+        --arg draft "$draft" \
+        --arg prerelease "$prerelease" \
+        '{}
+          + (if $title       != "" then {name: $title}                  else {} end)
+          + (if $body        != "" then {body: $body}                   else {} end)
+          + (if $draft       != "" then {draft: ($draft == "true")}     else {} end)
+          + (if $prerelease  != "" then {prerelease: ($prerelease == "true")} else {} end)')
+
+    local result
+    result=$(api_call PATCH "repos/$repo/releases/$release_id" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Updated release: \(.name) (\(.tag_name))\nURL: \(.html_url // "-")"'
+    fi
+}
+
+release_delete() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo release delete <owner/repo> <tag> [--yes]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local tag="$2"
+    shift 2
+
+    confirm_delete "release" "$tag" "$@"
+
+    api_call DELETE "repos/$repo/releases/tags/$tag" >/dev/null
+    echo "Deleted release: $tag"
+}
+
+release_upload_asset() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: forgejo release upload-asset <owner/repo> <tag> <file>..." >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local tag="$2"
+    shift 2
+
+    # Validate every file up-front so we don't half-upload before discovering
+    # a typo in arg N.
+    local f
+    for f in "$@"; do
+        if [[ ! -f "$f" ]]; then
+            echo "Not a regular file: $f" >&2
+            exit 1
+        fi
+    done
+
+    local release_id
+    release_id=$(resolve_release_id "$repo" "$tag")
+
+    local url="${FORGEJO_URL}/api/v1/repos/$repo/releases/$release_id/assets"
+    local uploaded=()
+
+    for f in "$@"; do
+        local tmp status
+        tmp=$(mktemp)
+        status=$(curl -s \
+            -X POST \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Accept: application/json" \
+            -F "attachment=@$f" \
+            -w '%{http_code}' \
+            -o "$tmp" \
+            "$url")
+
+        if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+            echo "Upload failed for $f (HTTP $status):" >&2
+            jq -r '.message // .error // .' "$tmp" >&2 2>/dev/null || cat "$tmp" >&2
+            rm -f "$tmp"
+            if [[ ${#uploaded[@]} -gt 0 ]]; then
+                echo "Files uploaded before failure: ${uploaded[*]}" >&2
+            fi
+            exit 1
+        fi
+
+        local asset_id
+        asset_id=$(jq -r '.id' "$tmp")
+        echo "Uploaded: $(basename "$f") (id=$asset_id)"
+        uploaded+=("$(basename "$f")")
+        rm -f "$tmp"
+    done
+}
+
+cmd_release_asset() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo release asset <list|delete> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)   release_asset_list "$@" ;;
+        delete) release_asset_delete "$@" ;;
+        *)      echo "Unknown release asset action: $action" >&2; exit 1 ;;
+    esac
+}
+
+release_asset_list() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo release asset list <owner/repo> <tag>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local tag="$2"
+    local release_id
+    release_id=$(resolve_release_id "$repo" "$tag")
+
+    local result
+    result=$(api_call GET "repos/$repo/releases/$release_id/assets")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+            echo "No assets found."
+        else
+            echo "$result" | jq -r '
+                ["ID","NAME","SIZE","DOWNLOADS","CREATED"],
+                (.[] | [
+                    .id,
+                    .name,
+                    .size,
+                    .download_count,
+                    (.created_at[:10])
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
+release_asset_delete() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: forgejo release asset delete <owner/repo> <tag> <asset_id> [--yes]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local tag="$2"
+    local asset_id="$3"
+    shift 3
+
+    confirm_delete "asset" "#$asset_id" "$@"
+
+    local release_id
+    release_id=$(resolve_release_id "$repo" "$tag")
+
+    api_call DELETE "repos/$repo/releases/$release_id/assets/$asset_id" >/dev/null
+    echo "Deleted asset #$asset_id"
+}
+
+# --- API PASSTHROUGH ---
+
+# Accumulates a JSON body and/or URL query string from -f / -F / --input args.
+# Writes results to globals:
+#   API_BODY  - JSON string (empty if no body fields)
+#   API_QUERY - URL-encoded query string without leading '?' (empty if no fields)
+# For GET/HEAD methods, fields go into API_QUERY. For others, into API_BODY.
+#
+# -f key=value      string field (always JSON string)
+# -F key=value      typed field: true/false -> bool, integers -> number,
+#                   @filename -> file contents (string), else string
+# -f key[]=value    array field (repeatable; accumulates)
+# --input -         read raw JSON body from stdin (overrides any -f/-F body)
+build_api_body() {
+    local method="$1"; shift
+    API_BODY=""
+    API_QUERY=""
+
+    local for_query=0
+    [[ "$method" == "GET" || "$method" == "HEAD" ]] && for_query=1
+
+    local -a query_pairs=()
+    local body_acc='{}'
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --input)
+                shift
+                if [[ "${1:-}" != "-" ]]; then
+                    echo "forgejo api: --input requires '-' (stdin) in v1" >&2
+                    exit 1
+                fi
+                API_BODY=$(cat)
+                shift
+                ;;
+            -f|-F)
+                local typed=0
+                [[ "$1" == "-F" ]] && typed=1
+                shift
+                if [[ $# -eq 0 || "$1" != *=* ]]; then
+                    echo "forgejo api: -f/-F requires key=value" >&2
+                    exit 1
+                fi
+                local kv="$1"; shift
+                local key="${kv%%=*}"
+                local val="${kv#*=}"
+                local is_array=0
+                if [[ "$key" == *"[]" ]]; then
+                    is_array=1
+                    key="${key%??}"
+                fi
+
+                # @file expansion (typed only)
+                if [[ "$typed" -eq 1 && "$val" == @* ]]; then
+                    val=$(cat "${val#@}")
+                fi
+
+                if [[ "$for_query" -eq 1 ]]; then
+                    local enc_k enc_v
+                    enc_k=$(printf '%s' "$key" | jq -sRr @uri)
+                    enc_v=$(printf '%s' "$val" | jq -sRr @uri)
+                    query_pairs+=("${enc_k}=${enc_v}")
+                    continue
+                fi
+
+                local jq_arg="--arg"
+                if [[ "$typed" -eq 1 ]]; then
+                    case "$val" in
+                        true|false) jq_arg="--argjson" ;;
+                        *) [[ "$val" =~ ^-?[0-9]+$ ]] && jq_arg="--argjson" ;;
+                    esac
+                fi
+
+                if [[ "$is_array" -eq 1 ]]; then
+                    body_acc=$(printf '%s' "$body_acc" | \
+                        jq --arg k "$key" "$jq_arg" v "$val" \
+                           '. + {($k): ((.[$k] // []) + [$v])}')
+                else
+                    body_acc=$(printf '%s' "$body_acc" | \
+                        jq --arg k "$key" "$jq_arg" v "$val" \
+                           '. + {($k): $v}')
+                fi
+                ;;
+            *)
+                echo "forgejo api: unknown arg: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ "$for_query" -eq 1 && "${#query_pairs[@]}" -gt 0 ]]; then
+        API_QUERY=$(IFS='&'; echo "${query_pairs[*]}")
+    elif [[ -z "$API_BODY" && "$body_acc" != "{}" ]]; then
+        API_BODY="$body_acc"
+    fi
+}
+
+cmd_api() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo api [METHOD] <path> [-f key=val]... [-F key=val]... [--input -]" >&2
+        exit 1
+    fi
+
+    local method
+    case "$1" in
+        GET|POST|PUT|PATCH|DELETE|HEAD)
+            method="$1"; shift ;;
+        *)
+            method="GET" ;;
+    esac
+
+    if [[ $# -eq 0 ]]; then
+        echo "forgejo api: missing path" >&2
+        exit 1
+    fi
+    local path="$1"; shift
+
+    local url
+    case "$path" in
+        http://*|https://*) url="$path" ;;
+        //*)
+            echo "forgejo api: path must not start with //" >&2
+            exit 1 ;;
+        /api/v1/*)          url="${FORGEJO_URL}${path}" ;;
+        /*)                 url="${FORGEJO_URL}/api/v1${path}" ;;
+        *)
+            echo "forgejo api: path must start with / or http(s)://" >&2
+            exit 1 ;;
+    esac
+
+    build_api_body "$method" "$@"
+
+    if [[ -n "$API_QUERY" ]]; then
+        url="${url}?${API_QUERY}"
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    local curl_args=(
+        -s
+        -X "$method"
+        -H "Authorization: token $FORGEJO_TOKEN"
+        -H "Accept: application/json"
+        -w '%{http_code}'
+        -o "$tmp"
+    )
+    if [[ -n "$API_BODY" ]]; then
+        curl_args+=(-H "Content-Type: application/json" -d "$API_BODY")
+    fi
+
+    local status rc=0
+    status=$(curl "${curl_args[@]}" "$url") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        rm -f "$tmp"
+        echo "forgejo: network error (curl exit $rc)" >&2
+        exit 1
+    fi
+
+    if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+        echo "forgejo api: HTTP $status" >&2
+        cat "$tmp" >&2
+        rm -f "$tmp"
+        exit 22
+    fi
+
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
+# --- BRANCH COMMANDS ---
+
+cmd_branch() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo branch <action> [args]" >&2
+        echo "Actions: list, view, delete, protect, unprotect" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list)      branch_list "$@" ;;
+        view)      branch_view "$@" ;;
+        delete)    branch_delete "$@" ;;
+        protect)   branch_protect "$@" ;;
+        unprotect) branch_unprotect "$@" ;;
+        *) echo "Unknown branch action: $action" >&2; exit 1 ;;
+    esac
+}
+
+branch_list() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: forgejo branch list <owner/repo>" >&2
+        exit 1
+    fi
+    local repo="$1"
+
+    local result
+    result=$(api_call GET "repos/$repo/branches")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        printf '%-30s %-10s %-12s %s\n' "NAME" "PROTECTED" "LAST_COMMIT" "DATE"
+        echo "$result" | jq -r '
+            .[] |
+            [
+                .name,
+                (if .protected then "yes" else "no" end),
+                .commit.id[:7],
+                (.commit.timestamp[:10])
+            ] | @tsv
+        ' | while IFS=$'\t' read -r name protected sha date; do
+            printf '%-30s %-10s %-12s %s\n' "$name" "$protected" "$sha" "$date"
+        done
+    fi
+}
+
+branch_view() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo branch view <owner/repo> <branch>" >&2
+        exit 1
+    fi
+    local repo="$1" branch="$2"
+
+    local branch_data
+    branch_data=$(api_call GET "repos/$repo/branches/$branch")
+
+    # Existence check on protection using the no-exit variant
+    local prot_resp prot_status prot_body
+    prot_resp=$(api_call_status GET "repos/$repo/branch_protections/$branch")
+    prot_status=$(printf '%s' "$prot_resp" | head -1)
+    prot_body=$(printf '%s' "$prot_resp" | tail -n +2)
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        local prot_json
+        case "$prot_status" in
+            200) prot_json="$prot_body" ;;
+            404) prot_json="null" ;;
+            *)   echo "branch view: protection check returned status $prot_status" >&2; exit 1 ;;
+        esac
+        echo "$branch_data" | jq --argjson p "$prot_json" '{branch: ., protection: $p}'
+        return
+    fi
+
+    echo "$branch_data" | jq -r '
+        "Branch:   \(.name)",
+        "Commit:   \(.commit.id)",
+        "Author:   \(.commit.author.name) (\(.commit.author.email))",
+        "Date:     \(.commit.timestamp[:16] | sub("T"; " "))",
+        "Message:  \(.commit.message | split("\n")[0])"
+    '
+    echo ""
+    if [[ "$prot_status" == "200" ]]; then
+        echo "$prot_body" | jq -r '
+            "Protection: enabled",
+            "  Push:               \(if .enable_push then "enabled" else "disabled" end)",
+            "  Merge whitelist:    \(if (.merge_whitelist_usernames | length) > 0 then (.merge_whitelist_usernames | join(", ")) else "-" end)",
+            "  Required approvals: \(.required_approvals)",
+            "  Dismiss stale:      \(if .dismiss_stale_approvals then "yes" else "no" end)",
+            "  Require signed:     \(if .require_signed_commits then "yes" else "no" end)"
+        '
+    elif [[ "$prot_status" == "404" ]]; then
+        echo "Protection: not protected"
+    else
+        echo "Protection: (status $prot_status — could not fetch protection info)" >&2
+        exit 1
+    fi
+}
+
+branch_delete() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo branch delete <owner/repo> <branch>" >&2
+        exit 1
+    fi
+    local repo="$1" branch="$2"
+
+    # No confirm_delete prompt: branches are recoverable via reflog and
+    # other branches in their ancestry, and the server refuses deletion
+    # of protected branches. Interactive confirm would break scripted use.
+    api_call DELETE "repos/$repo/branches/$branch" >/dev/null
+    echo "Deleted branch $branch"
+}
+
+branch_protect() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo branch protect <owner/repo> <branch> [flags]" >&2
+        exit 1
+    fi
+    local repo="$1" branch="$2"
+    shift 2
+
+    # Parse flags
+    local no_push=0 dismiss_stale=0 require_signed=0 block_outdated=0
+    local push_whitelist="" merge_whitelist="" required_approvals=""
+
+    has_flag "--no-push" "$@" && no_push=1
+    has_flag "--dismiss-stale-approvals" "$@" && dismiss_stale=1
+    has_flag "--require-signed" "$@" && require_signed=1
+    has_flag "--block-on-outdated" "$@" && block_outdated=1
+    push_whitelist=$(get_flag "--push-whitelist" "$@" 2>/dev/null || true)
+    merge_whitelist=$(get_flag "--merge-whitelist" "$@" 2>/dev/null || true)
+    required_approvals=$(get_flag "--required-approvals" "$@" 2>/dev/null || true)
+
+    if [[ "$no_push" -eq 1 && -n "$push_whitelist" ]]; then
+        echo "forgejo branch protect: --no-push and --push-whitelist are mutually exclusive" >&2
+        exit 1
+    fi
+
+    # Build body from flags (only set fields the user actually passed)
+    local body='{}'
+    if [[ "$no_push" -eq 1 ]]; then
+        body=$(printf '%s' "$body" | jq '. + {enable_push: false, enable_push_whitelist: false}')
+    elif [[ -n "$push_whitelist" ]]; then
+        local arr
+        arr=$(printf '%s' "$push_whitelist" | jq -Rc 'split(",") | map(select(length > 0))')
+        body=$(printf '%s' "$body" | jq --argjson arr "$arr" \
+            '. + {enable_push: true, enable_push_whitelist: true, push_whitelist_usernames: $arr}')
+    fi
+    if [[ -n "$merge_whitelist" ]]; then
+        local arr
+        arr=$(printf '%s' "$merge_whitelist" | jq -Rc 'split(",") | map(select(length > 0))')
+        body=$(printf '%s' "$body" | jq --argjson arr "$arr" \
+            '. + {enable_merge_whitelist: true, merge_whitelist_usernames: $arr}')
+    fi
+    if [[ -n "$required_approvals" ]]; then
+        if ! [[ "$required_approvals" =~ ^[0-9]+$ ]]; then
+            echo "forgejo branch protect: --required-approvals must be a non-negative integer" >&2
+            exit 1
+        fi
+        body=$(printf '%s' "$body" | jq --argjson n "$required_approvals" \
+            '. + {required_approvals: $n}')
+    fi
+    [[ "$dismiss_stale"  -eq 1 ]] && body=$(printf '%s' "$body" | jq '. + {dismiss_stale_approvals: true}')
+    [[ "$require_signed" -eq 1 ]] && body=$(printf '%s' "$body" | jq '. + {require_signed_commits: true}')
+    [[ "$block_outdated" -eq 1 ]] && body=$(printf '%s' "$body" | jq '. + {block_on_outdated_branch: true}')
+
+    # Existence check (no-exit)
+    local check status
+    check=$(api_call_status GET "repos/$repo/branch_protections/$branch")
+    status=$(printf '%s' "$check" | head -1)
+
+    local result
+    if [[ "$status" == "200" ]]; then
+        result=$(api_call PATCH "repos/$repo/branch_protections/$branch" "$body")
+    elif [[ "$status" == "404" ]]; then
+        # Safe default if no flags given: lock branch, no approvals
+        if [[ "$body" == "{}" ]]; then
+            body=$(jq -n '{enable_push: false, required_approvals: 0}')
+        fi
+        body=$(printf '%s' "$body" | jq --arg b "$branch" '. + {branch_name: $b}')
+        result=$(api_call POST "repos/$repo/branch_protections" "$body")
+    else
+        echo "forgejo branch protect: unexpected status $status checking existing protection" >&2
+        printf '%s\n' "$check" | tail -n +2 >&2
+        exit 1
+    fi
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        printf '%s' "$result" | jq .
+    else
+        local push_state mw approvals
+        push_state=$(printf '%s' "$result" | jq -r 'if .enable_push then "enabled" else "disabled" end')
+        mw=$(printf '%s' "$result" | jq -r 'if (.merge_whitelist_usernames | length) > 0 then (.merge_whitelist_usernames | join(",")) else "-" end')
+        approvals=$(printf '%s' "$result" | jq -r '.required_approvals')
+        echo "Protected $branch on $repo (push: $push_state, merge whitelist: $mw, approvals: $approvals)"
+    fi
+}
+
+branch_unprotect() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo branch unprotect <owner/repo> <branch>" >&2
+        exit 1
+    fi
+    local repo="$1" branch="$2"
+
+    local check status
+    check=$(api_call_status DELETE "repos/$repo/branch_protections/$branch")
+    status=$(printf '%s' "$check" | head -1)
+
+    case "$status" in
+        204|200)
+            echo "Removed protection on $branch" ;;
+        404)
+            echo "Branch $branch was not protected"
+            # exit 0 — idempotent
+            ;;
+        *)
+            echo "forgejo branch unprotect: unexpected status $status" >&2
+            printf '%s\n' "$check" | tail -n +2 >&2
+            exit 1 ;;
+    esac
+}
+
+cmd_admin() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo admin <cron|config|queue|stats|notice> [args]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        cron)   cmd_admin_cron   "$@" ;;
+        config) cmd_admin_config "$@" ;;
+        queue)  cmd_admin_queue  "$@" ;;
+        stats)  cmd_admin_stats  "$@" ;;
+        notice) cmd_admin_notice "$@" ;;
+        *)      echo "Unknown admin command: $action" >&2; exit 1 ;;
+    esac
+}
+
+# Stub for admin verbs that have no Forgejo API endpoint. Prints a
+# stderr message pointing at the web UI and exits 2. Used by queue/stats/
+# notice subnouns; see docs/superpowers/specs/2026-05-23-admin.md.
+admin_unsupported() {
+    local verb="$1"
+    local web_path="$2"
+    echo "forgejo: admin $verb is not exposed by the Forgejo API." >&2
+    echo "Use the web UI: ${FORGEJO_URL}${web_path}" >&2
+    exit 2
+}
+
+cmd_admin_stats() {
+    admin_unsupported "stats" "/-/admin"
+}
+
+cmd_admin_queue() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo admin queue <list|view|pause|resume> [args]" >&2
+        exit 1
+    fi
+    case "$1" in
+        list|view|pause|resume)
+            admin_unsupported "queue $1" "/-/admin/monitor/queue" ;;
+        *)
+            echo "Unknown admin queue command: $1" >&2; exit 1 ;;
+    esac
+}
+
+cmd_admin_notice() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo admin notice <list|delete> [args]" >&2
+        exit 1
+    fi
+    case "$1" in
+        list|delete)
+            admin_unsupported "notice $1" "/-/admin/notices" ;;
+        *)
+            echo "Unknown admin notice command: $1" >&2; exit 1 ;;
+    esac
+}
+
+cmd_admin_cron() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo admin cron <list|run> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list) admin_cron_list "$@" ;;
+        run)  admin_cron_run  "$@" ;;
+        *)    echo "Unknown admin cron command: $action" >&2; exit 1 ;;
+    esac
+}
+
+admin_cron_list() {
+    local result
+    result=$(api_call GET "admin/cron?limit=50")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+        return
+    fi
+
+    echo "$result" | jq -r '
+        (["NAME","SCHEDULE","NEXT","PREV","EXEC_TIMES"] | @tsv),
+        (.[] | [
+            (.name // "-"),
+            (.schedule // "-"),
+            ((.next // "-") | if . != "-" then .[:19] + "Z" else . end),
+            ((.prev // "-") | if . != "-" then .[:19] + "Z" else . end),
+            ((.exec_times // 0) | tostring)
+        ] | @tsv)
+    ' | column -t -s $'\t'
+}
+
+admin_cron_run() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: forgejo admin cron run <name>" >&2
+        exit 1
+    fi
+    local name="$1"
+    api_call POST "admin/cron/$name" > /dev/null
+    echo "Triggered cron task: $name"
+}
+
+cmd_admin_config() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo admin config <view> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        view) admin_config_view "$@" ;;
+        *)    echo "Unknown admin config command: $action" >&2; exit 1 ;;
+    esac
+}
+
+admin_config_view() {
+    local api_s att_s repo_s ui_s merged
+    api_s=$(api_call  GET "settings/api")
+    att_s=$(api_call  GET "settings/attachment")
+    repo_s=$(api_call GET "settings/repository")
+    ui_s=$(api_call   GET "settings/ui")
+
+    merged=$(jq -n \
+        --argjson api  "$api_s" \
+        --argjson att  "$att_s" \
+        --argjson repo "$repo_s" \
+        --argjson ui   "$ui_s" \
+        '{api:$api, attachment:$att, repository:$repo, ui:$ui}')
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$merged" | jq .
+        return
+    fi
+
+    local section
+    for section in api attachment repository ui; do
+        echo "[$section]"
+        echo "$merged" | jq -r --arg s "$section" '
+            .[$s] | to_entries | sort_by(.key)[] |
+            "\(.key): \(if (.value|type) == "array"
+                        then (.value|@json)
+                        else (.value|tostring)
+                        end)"
+        '
+        echo
+    done
+}
+
+cmd_auth() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo auth <status>" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        status) cmd_auth_status "$@" ;;
+        *)      echo "Unknown auth command: $action" >&2; exit 1 ;;
+    esac
+}
+
+cmd_auth_status() {
+    local result
+    result=$(api_call GET "user")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+        return
+    fi
+
+    local login email is_admin
+    login=$(echo "$result"    | jq -r '.login')
+    email=$(echo "$result"    | jq -r '.email // "-"')
+    is_admin=$(echo "$result" | jq -r '.is_admin')
+
+    local login_line="$login"
+    if [[ "$is_admin" == "true" ]]; then
+        login_line="$login (admin)"
+    fi
+
+    printf 'URL:    %s\n' "$FORGEJO_URL"
+    printf 'Login:  %s\n' "$login_line"
+    printf 'Email:  %s\n' "$email"
+    printf 'Scopes: %s\n' "not exposed by Forgejo API"
+}
+
+cmd_notification() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo notification <list|read> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        list) cmd_notification_list "$@" ;;
+        read) cmd_notification_read "$@" ;;
+        *)    echo "Unknown notification command: $action" >&2; exit 1 ;;
+    esac
+}
+
+cmd_notification_list() {
+    local all_param status limit
+    status=$(get_flag "--status" "$@" 2>/dev/null) || status=""
+    limit=$(get_flag  "--limit"  "$@" 2>/dev/null) || limit=""
+    all_param=""
+    if has_flag "--all" "$@"; then
+        all_param="all=true"
+    fi
+
+    if [[ -n "$limit" ]] && ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        echo "--limit must be a non-negative integer" >&2
+        exit 1
+    fi
+
+    local qs="$all_param"
+    if [[ -n "$status" ]]; then
+        local s
+        IFS=',' read -ra _statuses <<< "$status"
+        for s in "${_statuses[@]}"; do
+            [[ -n "$qs" ]] && qs="${qs}&"
+            qs="${qs}status-types=${s}"
+        done
+    fi
+    if [[ -n "$limit" ]]; then
+        [[ -n "$qs" ]] && qs="${qs}&"
+        qs="${qs}limit=${limit}"
+    fi
+
+    local endpoint="notifications"
+    [[ -n "$qs" ]] && endpoint="notifications?${qs}"
+
+    local result
+    result=$(api_call GET "$endpoint")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+        return
+    fi
+
+    if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+        echo "No notifications."
+        return
+    fi
+
+    echo "$result" | jq -r '
+        (["ID","REPO","TYPE","TITLE","STATE","UPDATED"] | @tsv),
+        (.[] | [
+            (.id|tostring),
+            (.repository.full_name // "-"),
+            (.subject.type // "-"),
+            ((.subject.title // "-")[:60]),
+            (.subject.state // "-"),
+            ((.updated_at // "-") | if . != "-" then .[:19] + "Z" else . end)
+        ] | @tsv)
+    ' | column -t -s $'\t'
+}
+
+cmd_notification_read() {
+    local has_id=0
+    local id=""
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        id="$1"
+        has_id=1
+        shift
+    fi
+    local all=0
+    if has_flag "--all" "$@"; then
+        all=1
+    fi
+
+    if [[ $has_id -eq 1 && $all -eq 1 ]]; then
+        echo "notification read: pass either <id> or --all, not both" >&2
+        exit 2
+    fi
+    if [[ $has_id -eq 0 && $all -eq 0 ]]; then
+        echo "Usage: forgejo notification read <id> | --all" >&2
+        exit 2
+    fi
+
+    if [[ $all -eq 1 ]]; then
+        api_call PUT "notifications?status-types=unread" > /dev/null
+        echo "Marked all unread notifications as read"
+        return
+    fi
+
+    api_call PATCH "notifications/threads/${id}?to-status=read" > /dev/null
+    echo "Marked thread ${id} as read"
+}
+
+cmd_search() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo search <repos|users|issues> [args]" >&2
+        exit 1
+    fi
+    local action="$1"; shift
+    case "$action" in
+        repos)  cmd_search_repos  "$@" ;;
+        users)  cmd_search_users  "$@" ;;
+        issues) cmd_search_issues "$@" ;;
+        *)      echo "Unknown search command: $action" >&2; exit 1 ;;
+    esac
+}
+
+cmd_search_repos() {
+    local query owner limit
+    query=$(get_flag "--query" "$@" 2>/dev/null) || query=""
+    owner=$(get_flag "--owner" "$@" 2>/dev/null) || owner=""
+    limit=$(get_flag "--limit" "$@" 2>/dev/null) || limit=""
+
+    if [[ -z "$query" ]]; then
+        echo "Usage: forgejo search repos --query=X [--owner=X] [--limit=N]" >&2
+        exit 1
+    fi
+    if [[ -n "$limit" ]] && ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        echo "--limit must be a non-negative integer" >&2
+        exit 1
+    fi
+
+    local query_enc
+    query_enc=$(printf '%s' "$query" | jq -sRr @uri)
+    local qs="q=${query_enc}"
+
+    if [[ -n "$owner" ]]; then
+        local uid
+        uid=$(api_call GET "users/${owner}" 2>/dev/null | jq -r '.id // empty') || true
+        if [[ -z "$uid" ]]; then
+            echo "forgejo: unknown owner '${owner}'" >&2
+            exit 1
+        fi
+        qs="${qs}&uid=${uid}"
+    fi
+    if [[ -n "$limit" ]]; then
+        qs="${qs}&limit=${limit}"
+    fi
+
+    local result
+    result=$(api_call GET "repos/search?${qs}")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+        return
+    fi
+
+    if echo "$result" | jq -e '.data | length == 0' > /dev/null 2>&1; then
+        echo "No repos found."
+        return
+    fi
+
+    echo "$result" | jq -r '
+        (["FULL_NAME","PRIVATE","ARCHIVED","STARS","DESCRIPTION"] | @tsv),
+        (.data[] | [
+            .full_name,
+            (if .private then "yes" else "no" end),
+            (if .archived then "yes" else "no" end),
+            (.stars_count|tostring),
+            ((.description // "")[:50])
+        ] | @tsv)
+    ' | column -t -s $'\t'
+}
+
+cmd_search_users() {
+    local query limit
+    query=$(get_flag "--query" "$@" 2>/dev/null) || query=""
+    limit=$(get_flag "--limit" "$@" 2>/dev/null) || limit=""
+
+    if [[ -z "$query" ]]; then
+        echo "Usage: forgejo search users --query=X [--limit=N]" >&2
+        exit 1
+    fi
+    if [[ -n "$limit" ]] && ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        echo "--limit must be a non-negative integer" >&2
+        exit 1
+    fi
+
+    local query_enc
+    query_enc=$(printf '%s' "$query" | jq -sRr @uri)
+    local qs="q=${query_enc}"
+    if [[ -n "$limit" ]]; then
+        qs="${qs}&limit=${limit}"
+    fi
+
+    local result
+    result=$(api_call GET "users/search?${qs}")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+        return
+    fi
+
+    if echo "$result" | jq -e '.data | length == 0' > /dev/null 2>&1; then
+        echo "No users found."
+        return
+    fi
+
+    echo "$result" | jq -r '
+        (["LOGIN","FULL_NAME","EMAIL","ACTIVE"] | @tsv),
+        (.data[] | [
+            .login,
+            (if (.full_name // "") == "" then "-" else .full_name end),
+            (if (.email // "") == "" then "-" else .email end),
+            (if .active then "yes" else "no" end)
+        ] | @tsv)
+    ' | column -t -s $'\t'
+}
+
+cmd_search_issues() {
+    local query type state owner limit
+    query=$(get_flag "--query" "$@" 2>/dev/null) || query=""
+    type=$(get_flag  "--type"  "$@" 2>/dev/null) || type=""
+    state=$(get_flag "--state" "$@" 2>/dev/null) || state=""
+    owner=$(get_flag "--owner" "$@" 2>/dev/null) || owner=""
+    limit=$(get_flag "--limit" "$@" 2>/dev/null) || limit=""
+
+    if [[ -z "$query" ]]; then
+        echo "Usage: forgejo search issues --query=X [--type=issue|pr] [--state=open|closed|all] [--owner=X] [--limit=N]" >&2
+        exit 1
+    fi
+    if [[ -n "$limit" ]] && ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+        echo "--limit must be a non-negative integer" >&2
+        exit 1
+    fi
+
+    local type_param=""
+    case "$type" in
+        "")     type_param="" ;;
+        issue)  type_param="type=issues" ;;
+        pr)     type_param="type=pulls"  ;;
+        *)      echo "--type must be 'issue' or 'pr' (got: $type)" >&2; exit 1 ;;
+    esac
+
+    local query_enc
+    query_enc=$(printf '%s' "$query" | jq -sRr @uri)
+    local qs="q=${query_enc}"
+
+    if [[ -n "$type_param" ]]; then
+        qs="${qs}&${type_param}"
+    fi
+    if [[ -n "$state" ]]; then
+        qs="${qs}&state=${state}"
+    fi
+    if [[ -n "$owner" ]]; then
+        local owner_enc
+        owner_enc=$(printf '%s' "$owner" | jq -sRr @uri)
+        qs="${qs}&owner=${owner_enc}"
+    fi
+    if [[ -n "$limit" ]]; then
+        qs="${qs}&limit=${limit}"
+    fi
+
+    local result
+    result=$(api_call GET "repos/issues/search?${qs}")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+        return
+    fi
+
+    if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+        echo "No issues found."
+        return
+    fi
+
+    echo "$result" | jq -r '
+        (["REPO","#","TYPE","STATE","TITLE"] | @tsv),
+        (.[] | [
+            (.repository.full_name // "-"),
+            (.number|tostring),
+            (if .pull_request then "pr" else "issue" end),
+            .state,
+            (.title // "")[:50]
+        ] | @tsv)
+    ' | column -t -s $'\t'
+}
+
+# --- MAIN ---
+
+check_deps
+# Parse global --json flag
+args=()
+for arg in "$@"; do
+    if [[ "$arg" == "--json" ]]; then
+        JSON_OUTPUT=1
+    else
+        args+=("$arg")
+    fi
+done
+set -- "${args[@]+"${args[@]}"}"
+
+if [[ $# -eq 0 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    show_usage
+    exit 0
+fi
+
+load_config
+
+case "$1" in
+    api)     shift; cmd_api "$@" ;;
+    branch)  shift; cmd_branch "$@" ;;
+    repo)    shift; cmd_repo "$@" ;;
+    issue)   shift; cmd_issue "$@" ;;
+    actions) shift; cmd_actions "$@" ;;
+    pr)      shift; cmd_pr "$@" ;;
+    release) shift; cmd_release "$@" ;;
+    user)    shift; cmd_user "$@" ;;
+    org)     shift; cmd_org "$@" ;;
+    admin)   shift; cmd_admin "$@" ;;
+    auth)         shift; cmd_auth "$@" ;;
+    notification) shift; cmd_notification "$@" ;;
+    search)       shift; cmd_search "$@" ;;
+    *)       echo "Unknown resource: $1" >&2; show_usage; exit 1 ;;
+esac

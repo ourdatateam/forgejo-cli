@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Pre-commit hook: lints shell files with shellcheck.
+# Activated per-clone via: git config core.hooksPath hooks
+set -euo pipefail
+
+FILES=(forgejo hooks/pre-commit)
+
+if ! command -v shellcheck &>/dev/null; then
+    echo "pre-commit: shellcheck not found on PATH." >&2
+    echo "Install with: sudo apt install shellcheck" >&2
+    echo "Or bypass this hook for one commit: git commit --no-verify" >&2
+    exit 1
+fi
+
+shellcheck "${FILES[@]}"
