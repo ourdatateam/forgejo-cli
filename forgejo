@@ -4850,17 +4850,14 @@ cmd_auth_login() {
     fi
 
     mkdir -p "$(dirname "$CONFIG_FILE")"
-    (
-        umask 077
-        {
-            printf 'FORGEJO_URL=%q\n' "$url"
-            printf 'FORGEJO_TOKEN=%q\n' "$token"
-            if [[ "$store_password" -eq 1 ]]; then
-                printf 'FORGEJO_PASSWORD=%q\n' "$password"
-            fi
-        } > "$CONFIG_FILE"
-    )
-    chmod 600 "$CONFIG_FILE"
+    install -m 600 /dev/null "$CONFIG_FILE"
+    {
+        printf 'FORGEJO_URL=%q\n' "$url"
+        printf 'FORGEJO_TOKEN=%q\n' "$token"
+        if [[ "$store_password" -eq 1 ]]; then
+            printf 'FORGEJO_PASSWORD=%q\n' "$password"
+        fi
+    } > "$CONFIG_FILE"
 
     echo "Logged in as ${login:-$user} at $url."
 }
