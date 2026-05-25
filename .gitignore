@@ -4,3 +4,6 @@
 
 # Per-developer scratch / session state — never commit
 .remember/
+
+# Superpowers planning artifacts (design specs / implementation plans) — never commit
+docs/superpowers/
