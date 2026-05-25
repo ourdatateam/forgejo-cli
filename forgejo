@@ -292,7 +292,7 @@ Resources:
   user     Manage users (admin)
   org      Manage organizations
   admin    Server administration (cron, config)
-  auth         Authentication status (whoami)
+  auth         Log in and check authentication status
   notification Notification inbox
   search       Search across the instance
 
@@ -456,6 +456,7 @@ Admin commands:
   admin notice list|delete                              Not exposed by Forgejo API - use web UI
 
 Auth commands:
+  auth login                                            Interactive setup: prompt, mint a token, write config
   auth status                                           Print URL/login/email + scopes-not-exposed note
 
 Notification commands:
@@ -4738,9 +4739,135 @@ admin_config_view() {
     done
 }
 
+# Interactive first-run setup. Runs BEFORE load_config (see MAIN), because the
+# config file may not exist yet. Mints an API token over HTTP Basic auth and
+# writes a 600-mode config. Forgejo requires Basic auth (not bearer) to mint
+# tokens, so this cannot reuse api_call/api_call_basic (those read a
+# not-yet-loaded config).
+cmd_auth_login() {
+    local url user password token_name host token login reply keep
+    local body tmp status rc=0
+    local vtmp vstatus vrc=0
+    local store_password=0
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local existing_url=""
+        existing_url=$(grep -E '^FORGEJO_URL=' "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)
+        echo "A config already exists at $CONFIG_FILE" >&2
+        [[ -n "$existing_url" ]] && echo "  Current URL: $existing_url" >&2
+        read -rp "Overwrite it? (y/N) " reply
+        if [[ "$reply" != "y" && "$reply" != "Y" ]]; then
+            echo "Aborted." >&2
+            exit 1
+        fi
+    fi
+
+    read -rp "Forgejo URL (e.g. https://forgejo.example.com): " url
+    url="${url%/}"
+    if [[ "$url" != http://* && "$url" != https://* ]]; then
+        echo "URL must start with http:// or https://" >&2
+        exit 1
+    fi
+
+    read -rp "Username: " user
+    if [[ -z "$user" ]]; then
+        echo "Username is required." >&2
+        exit 1
+    fi
+
+    read -rsp "Password: " password
+    echo
+    if [[ -z "$password" ]]; then
+        echo "Password is required." >&2
+        exit 1
+    fi
+
+    host=$(hostname -s 2>/dev/null || echo host)
+    token_name="forgejo-cli-${host}-$(date +%Y%m%d%H%M%S)"
+
+    body=$(jq -n --arg n "$token_name" '{name: $n, scopes: ["all"]}')
+    tmp=$(mktemp)
+    status=$(curl -s -X POST \
+        -u "${user}:${password}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -d "$body" \
+        -w '%{http_code}' \
+        -o "$tmp" \
+        "${url}/api/v1/users/${user}/tokens") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        rm -f "$tmp"
+        echo "forgejo: network error (curl exit $rc)" >&2
+        exit 1
+    fi
+
+    if [[ "$status" == "401" ]]; then
+        rm -f "$tmp"
+        echo "Authentication failed." >&2
+        echo "If this account has 2FA enabled, this flow can't mint a token -- create" >&2
+        echo "one in the web UI (Settings -> Applications) and set FORGEJO_TOKEN" >&2
+        echo "manually in $CONFIG_FILE. Otherwise, check your username and password." >&2
+        exit 1
+    fi
+
+    if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+        echo "API error ($status):" >&2
+        jq -r '.message // .error // .' "$tmp" >&2 2>/dev/null || cat "$tmp" >&2
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    token=$(jq -r '.sha1 // empty' "$tmp")
+    rm -f "$tmp"
+    if [[ -z "$token" ]]; then
+        echo "forgejo: token endpoint returned no sha1 value." >&2
+        exit 1
+    fi
+
+    vtmp=$(mktemp)
+    vstatus=$(curl -s -X GET \
+        -H "Authorization: token $token" \
+        -H "Accept: application/json" \
+        -w '%{http_code}' \
+        -o "$vtmp" \
+        "${url}/api/v1/user") || vrc=$?
+    if [[ "$vrc" -ne 0 ]]; then
+        rm -f "$vtmp"
+        echo "forgejo: network error verifying token (curl exit $vrc)" >&2
+        exit 1
+    fi
+    if [[ "$vstatus" -lt 200 || "$vstatus" -ge 300 ]]; then
+        echo "Token verification failed (status $vstatus)." >&2
+        rm -f "$vtmp"
+        exit 1
+    fi
+    login=$(jq -r '.login // empty' "$vtmp")
+    rm -f "$vtmp"
+
+    read -rp "Store password for token-management commands? (y/N) " keep
+    if [[ "$keep" == "y" || "$keep" == "Y" ]]; then
+        store_password=1
+    fi
+
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    (
+        umask 077
+        {
+            printf 'FORGEJO_URL=%q\n' "$url"
+            printf 'FORGEJO_TOKEN=%q\n' "$token"
+            if [[ "$store_password" -eq 1 ]]; then
+                printf 'FORGEJO_PASSWORD=%q\n' "$password"
+            fi
+        } > "$CONFIG_FILE"
+    )
+    chmod 600 "$CONFIG_FILE"
+
+    echo "Logged in as ${login:-$user} at $url."
+}
+
 cmd_auth() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: forgejo auth <status>" >&2
+        echo "Usage: forgejo auth <login|status>" >&2
         exit 1
     fi
     local action="$1"; shift
@@ -5079,6 +5206,12 @@ set -- "${args[@]+"${args[@]}"}"
 if [[ $# -eq 0 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
     show_usage
     exit 0
+fi
+
+if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then
+    shift 2
+    cmd_auth_login "$@"
+    exit $?
 fi
 
 load_config
