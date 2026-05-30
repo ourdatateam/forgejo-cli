@@ -7,6 +7,7 @@ FORGEJO_URL=""
 FORGEJO_TOKEN=""
 FORGEJO_LOG_PATH=""
 FORGEJO_PASSWORD=""
+FORGEJO_REVIEW_TOKEN=""   # optional: submit `pr review` as a separate identity
 
 check_deps() {
     local missing=()
@@ -4117,8 +4118,14 @@ pr_review_create() {
         body=$(jq -n --arg e "$event" '{event: $e}')
     fi
 
+    # Submit the review under a separate identity when FORGEJO_REVIEW_TOKEN is
+    # set. Forgejo forbids approving/rejecting your own PR; when many actors
+    # share one token the author and reviewer collapse to the same user, so the
+    # review is rejected. The opt-in review token (a distinct account) keeps
+    # author != reviewer. Unset -> falls back to FORGEJO_TOKEN (no behaviour change).
     local result
-    result=$(api_call POST "repos/$repo/pulls/$number/reviews" "$body")
+    result=$(FORGEJO_TOKEN="${FORGEJO_REVIEW_TOKEN:-$FORGEJO_TOKEN}" \
+        api_call POST "repos/$repo/pulls/$number/reviews" "$body")
 
     if [[ "$JSON_OUTPUT" -eq 1 ]]; then
         echo "$result" | jq .
