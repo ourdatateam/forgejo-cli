@@ -322,6 +322,7 @@ Resources:
   actions  CI/Actions workflow runs
   pr       Pull requests
   release  Releases and tags
+  wiki     Wiki pages
   user     Manage users (admin)
   org      Manage organizations
   admin    Server administration (cron, config)
@@ -435,6 +436,14 @@ Release commands:
   release upload-asset <owner/repo> <tag> <file>...     Upload one or more asset files (fail-fast)
   release asset list <owner/repo> <tag>                 List release assets
   release asset delete <owner/repo> <tag> <asset_id> [--yes]  Delete asset (confirms by id)
+
+Wiki commands:
+  wiki list <owner/repo>                                List wiki pages
+  wiki view <owner/repo> <page>                         View a page (decoded content)
+  wiki create <owner/repo> --title=X [--content=X|--file=path|--file=-] [--message=X]  Create a page
+  wiki edit <owner/repo> <page> [--title=X] [--content=X|--file=path|--file=-] [--message=X]  Edit/rename a page
+  wiki delete <owner/repo> <page> [--yes]               Delete a page (confirms by title)
+  wiki revisions <owner/repo> <page>                    Show a page's commit history
 
 User commands (admin):
   user list                                             List users
@@ -4602,6 +4611,326 @@ release_asset_delete() {
     echo "Deleted asset #$asset_id"
 }
 
+# --- WIKI COMMANDS ---
+
+# URL-encodes a single path segment (wiki page titles may contain spaces and
+# other unsafe characters). Prints the encoded value to stdout.
+wiki_encode_page() {
+    printf '%s' "$1" | jq -sRr @uri
+}
+
+# Resolves wiki page content from --content= or --file= (in that precedence).
+# --file=- reads from stdin. Prints the resolved content to stdout. Return
+# codes: 0 = resolved, 1 = no source supplied, 2 = --file path is not a
+# regular file (message already emitted to stderr). There is no implicit
+# stdin: piping requires an explicit --file=-.
+#
+# Usage:
+#   rc=0; content=$(wiki_resolve_content "$@" && printf 'x') || rc=$?
+wiki_resolve_content() {
+    local content file
+    local rc=0
+    content=$(get_flag "--content" "$@" 2>/dev/null && printf 'x') || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        # get_flag echoes the value with one trailing newline; the 'x' sentinel
+        # (only appended when get_flag succeeds, via &&) lets $(...) keep the
+        # user's own trailing newlines. Strip the sentinel, then the single
+        # newline echo added.
+        content=${content%x}
+        printf '%s' "${content%$'\n'}"
+        return 0
+    fi
+    if file=$(get_flag "--file" "$@" 2>/dev/null); then
+        if [[ "$file" == "-" ]]; then
+            cat
+            return 0
+        fi
+        if [[ ! -f "$file" ]]; then
+            echo "Not a regular file: $file" >&2
+            return 2
+        fi
+        cat "$file"
+        return 0
+    fi
+    return 1
+}
+
+cmd_wiki() {
+    if [[ $# -eq 0 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+        show_wiki_help
+        exit 0
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)      wiki_list "$@" ;;
+        view)      wiki_view "$@" ;;
+        create)    wiki_create "$@" ;;
+        edit)      wiki_edit "$@" ;;
+        delete)    wiki_delete "$@" ;;
+        revisions) wiki_revisions "$@" ;;
+        *)         echo "Unknown wiki action: $action" >&2; exit 1 ;;
+    esac
+}
+
+show_wiki_help() {
+    cat <<'EOF'
+forgejo wiki — manage repository wiki pages
+
+Usage:
+  forgejo wiki list <owner/repo>
+  forgejo wiki view <owner/repo> <page>
+  forgejo wiki create <owner/repo> --title=X [--content=X|--file=path|--file=-] [--message=X]
+  forgejo wiki edit <owner/repo> <page> [--title=X] [--content=X|--file=path|--file=-] [--message=X]
+  forgejo wiki delete <owner/repo> <page> [--yes]
+  forgejo wiki revisions <owner/repo> <page>
+
+Content sources (create/edit), in precedence order:
+  --content=TEXT    inline content
+  --file=PATH       read content from a file
+  --file=-          read content from stdin
+
+Notes:
+  - Page names may contain spaces; quote them (e.g. "Release Notes").
+  - edit requires --title and/or a content source; with neither it errors.
+  - --message sets the commit message; omitted uses the server default.
+
+Global flags:
+  --json   Output raw JSON instead of formatted columns
+EOF
+}
+
+wiki_list() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo wiki list <owner/repo>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local result
+    result=$(api_call GET "repos/$repo/wiki/pages?limit=50")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e 'length == 0' > /dev/null 2>&1; then
+            echo "No wiki pages found."
+        else
+            echo "$result" | jq -r '
+                ["TITLE","UPDATED","AUTHOR"],
+                (.[] | [
+                    .title,
+                    (.last_commit.author.date // "")[:10],
+                    (.last_commit.author.name // "-")
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
+wiki_view() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo wiki view <owner/repo> <page>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local page="$2"
+    local page_enc
+    page_enc=$(wiki_encode_page "$page")
+
+    local result
+    result=$(api_call GET "repos/$repo/wiki/page/$page_enc")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '
+            "Title:    \(.title)",
+            "Updated:  \(.last_commit.author.date // "-")",
+            "Author:   \(.last_commit.author.name // "-")",
+            "Commit:   \(.last_commit.sha // "-")",
+            ""
+        '
+        # Content is base64-encoded; decode and print verbatim.
+        echo "$result" | jq -r '.content_base64 // ""' | base64 -d
+    fi
+}
+
+wiki_create() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: forgejo wiki create <owner/repo> --title=X [--content=X|--file=path|--file=-] [--message=X]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    shift
+
+    local title message content
+    title=$(get_flag "--title" "$@" 2>/dev/null) || { echo "Missing --title" >&2; exit 1; }
+    message=$(get_flag "--message" "$@" 2>/dev/null) || message=""
+
+    # Capture with a sentinel so $(...) does not strip trailing newlines.
+    # rc=2 means --file pointed at a non-regular file (already reported);
+    # rc=1 means no content source was supplied.
+    local rc=0
+    content=$(wiki_resolve_content "$@" && printf 'x') || rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+        exit 1
+    elif [[ "$rc" -ne 0 ]]; then
+        echo "No content supplied. Use --content=X, --file=path, or --file=- to read stdin (use --content='' for an empty page)." >&2
+        exit 1
+    fi
+    content=${content%x}
+
+    # base64 here is GNU coreutils (Linux target): -w0 encodes without
+    # wrapping; -d decodes (see wiki_view).
+    local content_b64
+    content_b64=$(printf '%s' "$content" | base64 -w0)
+
+    local body
+    body=$(jq -n \
+        --arg title "$title" \
+        --arg content "$content_b64" \
+        --arg message "$message" \
+        '{title: $title, content_base64: $content}
+          + (if $message != "" then {message: $message} else {} end)')
+
+    local result
+    result=$(api_call POST "repos/$repo/wiki/new" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Created wiki page: \(.title)"'
+    fi
+}
+
+wiki_edit() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo wiki edit <owner/repo> <page> [--title=X] [--content=X|--file=path|--file=-] [--message=X]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local page="$2"
+    shift 2
+
+    local title message
+    title=$(get_flag "--title" "$@" 2>/dev/null) || title=""
+    message=$(get_flag "--message" "$@" 2>/dev/null) || message=""
+
+    # Resolve content only if a source was supplied; absent source leaves
+    # content unchanged. Sentinel ('x') preserves trailing newlines. rc=2
+    # means --file pointed at a non-regular file (already reported) → abort.
+    local content="" have_content=0 rc=0
+    content=$(wiki_resolve_content "$@" && printf 'x') || rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+        exit 1
+    elif [[ "$rc" -eq 0 ]]; then
+        have_content=1
+        content=${content%x}
+    fi
+
+    if [[ -z "$title" && "$have_content" -eq 0 ]]; then
+        echo "Nothing to edit (supply --title and/or content via --content/--file)." >&2
+        exit 1
+    fi
+
+    # Forgejo's wiki PATCH requires a title; omitting it renames the page to
+    # "unnamed". When the user didn't pass --title, keep the current name.
+    if [[ -z "$title" ]]; then
+        title="$page"
+    fi
+
+    local page_enc
+    page_enc=$(wiki_encode_page "$page")
+
+    local content_b64
+    if [[ "$have_content" -eq 1 ]]; then
+        content_b64=$(printf '%s' "$content" | base64 -w0)
+    else
+        # Rename-only edit: Forgejo's PATCH blanks content when content_base64
+        # is omitted, so fetch the current content and resend it unchanged.
+        local current
+        current=$(api_call GET "repos/$repo/wiki/page/$page_enc")
+        content_b64=$(echo "$current" | jq -r '.content_base64 // ""')
+    fi
+
+    local body
+    body=$(jq -n \
+        --arg title "$title" \
+        --arg content "$content_b64" \
+        --arg message "$message" \
+        '{title: $title, content_base64: $content}
+          + (if $message != "" then {message: $message} else {} end)')
+
+    local result
+    result=$(api_call PATCH "repos/$repo/wiki/page/$page_enc" "$body")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        echo "$result" | jq -r '"Updated wiki page: \(.title)"'
+    fi
+}
+
+wiki_delete() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo wiki delete <owner/repo> <page> [--yes]" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local page="$2"
+    shift 2
+
+    confirm_delete "wiki page" "$page" "$@"
+
+    local page_enc
+    page_enc=$(wiki_encode_page "$page")
+
+    api_call DELETE "repos/$repo/wiki/page/$page_enc" >/dev/null
+    echo "Deleted wiki page: $page"
+}
+
+wiki_revisions() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: forgejo wiki revisions <owner/repo> <page>" >&2
+        exit 1
+    fi
+
+    local repo="$1"
+    local page="$2"
+    local page_enc
+    page_enc=$(wiki_encode_page "$page")
+
+    local result
+    result=$(api_call GET "repos/$repo/wiki/revisions/$page_enc")
+
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        echo "$result" | jq .
+    else
+        if echo "$result" | jq -e '(.commits // []) | length == 0' > /dev/null 2>&1; then
+            echo "No revisions found."
+        else
+            echo "$result" | jq -r '
+                ["SHA","DATE","AUTHOR","MESSAGE"],
+                (.commits[] | [
+                    ((.sha // "") | .[:10]),
+                    (.author.date // "")[:10],
+                    (.author.name // "-"),
+                    ((.message // "") | gsub("\n";" "))[:50]
+                ])
+                | @tsv
+            ' | column -t -s $'\t'
+        fi
+    fi
+}
+
 # --- API PASSTHROUGH ---
 
 # Accumulates a JSON body and/or URL query string from -f / -F / --input args.
@@ -5615,6 +5944,7 @@ if [[ $# -ge 2 ]] && [[ "$2" == "--help" || "$2" == "-h" ]]; then
     case "$1" in
         issue) show_issue_help ;;
         pr)    show_pr_help ;;
+        wiki)  show_wiki_help ;;
         *)     show_usage ;;
     esac
     exit 0
@@ -5636,6 +5966,7 @@ case "$1" in
     actions) shift; cmd_actions "$@" ;;
     pr)      shift; cmd_pr "$@" ;;
     release) shift; cmd_release "$@" ;;
+    wiki)    shift; cmd_wiki "$@" ;;
     user)    shift; cmd_user "$@" ;;
     org)     shift; cmd_org "$@" ;;
     admin)   shift; cmd_admin "$@" ;;
