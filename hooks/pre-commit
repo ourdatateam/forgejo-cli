@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Pre-commit hook: lints shell files with shellcheck.
+# Pre-commit hook: lints shell files with shellcheck; gates the Go port with
+# gofmt/vet/test and generated-docs freshness when Go files are staged.
 # Activated per-clone via: git config core.hooksPath hooks
 set -euo pipefail
 
-FILES=(forgejo hooks/pre-commit)
+FILES=(forgejo hooks/pre-commit scripts/acceptance.sh scripts/parity.sh)
 
 if ! command -v shellcheck &>/dev/null; then
     echo "pre-commit: shellcheck not found on PATH." >&2
@@ -12,4 +13,28 @@ if ! command -v shellcheck &>/dev/null; then
     exit 1
 fi
 
-shellcheck "${FILES[@]}"
+existing=()
+for f in "${FILES[@]}"; do
+    [[ -f "$f" ]] && existing+=("$f")
+done
+shellcheck "${existing[@]}"
+
+# Go gate: only when Go files (or go.mod) are staged.
+if git diff --cached --name-only | grep -qE '\.go$|^go\.(mod|sum)$'; then
+    if ! command -v go &>/dev/null; then
+        echo "pre-commit: Go files staged but go is not on PATH." >&2
+        exit 1
+    fi
+    unformatted=$(gofmt -l ./cmd ./internal ./tools 2>/dev/null || true)
+    if [[ -n "$unformatted" ]]; then
+        echo "pre-commit: gofmt needed on:" >&2
+        echo "$unformatted" >&2
+        exit 1
+    fi
+    go vet ./...
+    go test ./... >/dev/null
+    # Generated skill references must match the command tree.
+    if [[ -f Makefile ]] && grep -q '^docs-check:' Makefile; then
+        make -s docs-check
+    fi
+fi
