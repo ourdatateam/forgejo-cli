@@ -38,21 +38,21 @@ step() {
 }
 
 step "repo view"            "$BIN" repo view "$REPO"
-step "repo edit"            "$BIN" repo edit "$REPO" --description="acceptance run"
-step "repo topic add"       "$BIN" repo topic add "$REPO" --topic=acceptance
+step "repo edit"            "$BIN" repo edit "$REPO" --desc="acceptance run"
+step "repo topic add"       "$BIN" repo topic add "$REPO" --topics=acceptance
 step "repo topic list"      "$BIN" repo topic list "$REPO"
 
 step "issue create"         "$BIN" issue create "$REPO" --title="acc issue" --body="body text"
 step "issue list"           "$BIN" issue list "$REPO"
 step "issue view"           "$BIN" issue view "$REPO" 1
 step "issue comment"        "$BIN" issue comment "$REPO" 1 --body="a comment"
-step "label create"         "$BIN" issue label "$REPO" create --name=acc --color="#00aabb"
+step "label create"         "$BIN" issue label "$REPO" create --name=acc --color="#00aabb" --scope=repo
 step "issue label add"      "$BIN" issue label "$REPO" add 1 --labels=acc
 step "issue close"          "$BIN" issue close "$REPO" 1
 step "issue reopen"         "$BIN" issue reopen "$REPO" 1
 
-step "milestone create"     "$BIN" issue milestone "$REPO" create --title=m1
-step "milestone list"       "$BIN" issue milestone "$REPO" list
+step "milestone create"     "$BIN" issue milestone create "$REPO" --title=m1
+step "milestone list"       "$BIN" issue milestone list "$REPO"
 
 step "branch list"          "$BIN" branch list "$REPO"
 step "wiki create"          "$BIN" wiki create "$REPO" --title="Home" --content="hello"
@@ -63,7 +63,7 @@ step "release create"       "$BIN" release create "$REPO" --tag=v0.0.1 --title="
 step "release list"         "$BIN" release list "$REPO"
 
 # PR flow: create a branch + file via api, then PR verbs.
-step "branch create"        "$BIN" branch create "$REPO" acc-branch --ref=main
+step "branch create"        "$BIN" branch create "$REPO" acc-branch --from=main
 step "api file put"         "$BIN" api POST "/repos/$REPO/contents/acc.txt" \
                                 -f content="$(printf 'acceptance' | base64)" \
                                 -f message="add acc.txt" -f branch=acc-branch
@@ -71,7 +71,7 @@ step "pr create"            "$BIN" pr create "$REPO" --title="acc pr" --head=acc
 step "pr list"              "$BIN" pr list "$REPO"
 step "pr view"              "$BIN" pr view "$REPO" 2
 step "pr diff"              "$BIN" pr diff "$REPO" 2
-step "pr comment create"    "$BIN" pr comment "$REPO" create 2 --body="pr comment"
+step "pr comment create"    "$BIN" pr comment "$REPO" 2 --body="pr comment"
 step "pr merge"             "$BIN" pr merge "$REPO" 2 --method=squash
 
 step "dry-run blocks write" bash -c "! $BIN --dry-run issue create '$REPO' --title=x 2>/dev/null | grep -q ."
