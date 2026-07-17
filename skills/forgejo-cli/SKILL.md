@@ -11,6 +11,12 @@ description: >
 
 # forgejo CLI — core usage
 
+`forgejo` is a single static Go binary (v0.1.0+; check with
+`forgejo --version`). If `--version` errors with "unexpected argument",
+you're holding the legacy bash script (installed as `forgejo-bash` where
+kept) — it lacks `-R`, `--jq`, `pr checkout`, and the incremental edit
+flags; prefer the Go binary, installable from the repo's release tarballs.
+
 Config: `~/.config/forgejo-cli/config` (mode 600) with `FORGEJO_URL` and
 `FORGEJO_TOKEN` (or `FORGEJO_TOKEN_COMMAND=op read "op://..."`). Env vars
 override the file. First-time setup: `forgejo auth login`. Sanity check:
