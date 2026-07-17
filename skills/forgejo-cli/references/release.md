@@ -13,6 +13,7 @@ These inherited flags apply to commands in this group unless a command defines a
 | `--json` | `bool` | `false` | output raw JSON from the server |
 | `--limit` | `int` | `-1` | max items for list verbs (0 = fetch all pages; default: per-verb) |
 | `--verbose` | `bool` | `false` | log requests to stderr (tokens are never logged) |
+| `-R, --repo` | `string` | `""` | target repository as owner/repo (gh-style alternative to the repo positional; '.' infers from the cwd git remote) |
 
 ## forgejo release asset
 
@@ -78,6 +79,17 @@ Delete a release by tag. This is destructive and requires --yes or a typed tag c
 | Name | Type | Default | Help |
 | :--- | :--- | :--- | :--- |
 | `--yes` | `bool` | `false` | skip the delete confirmation prompt |
+
+## forgejo release download
+
+Use: `forgejo release download <owner/repo> <tag> [--pattern=GLOB] [--output=DIR]`
+
+Download assets attached to a release by tag. --pattern filters asset names with path.Match; --output is a directory (default: .).
+
+| Name | Type | Default | Help |
+| :--- | :--- | :--- | :--- |
+| `--output` | `string` | `.` | directory to write downloaded assets into |
+| `--pattern` | `string` | `""` | glob pattern for asset names |
 
 ## forgejo release edit
 

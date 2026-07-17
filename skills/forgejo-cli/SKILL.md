@@ -24,7 +24,9 @@ forgejo <resource> <verb> [<owner/repo>] [args] [--flags]
 
 - The repo positional is **required** where a verb targets a repo. Pass `.`
   to use the current directory's git remote (only remotes on the configured
-  Forgejo host match).
+  Forgejo host match). gh-style `-R owner/repo` / `--repo owner/repo` also
+  works anywhere on the line and fills the repo slot (`forgejo pr list -R
+  owner/repo`); `-R .` infers like the positional dot.
 - Flags are `--flag=value` or `--flag value`. Unknown flags are errors.
 - `--json` on any verb prints pretty JSON — this is the stable output
   contract; parse it, not the text tables. `--jq '<expr>'` filters it
@@ -53,11 +55,15 @@ forgejo pr list <o/r> [--state=...]
 forgejo pr create <o/r> --title=T --head=branch --base=main [--body=-]
 forgejo pr view <o/r> <n>               # FULL conversation: reviews+comments
 forgejo pr diff <o/r> <n>               # raw diff
+forgejo pr checkout <o/r> <n>           # fetch + switch to the PR head branch
+forgejo pr edit <o/r> <n> --add-labels=x --add-reviewers=user
 forgejo pr review <o/r> <n> --approve|--request-changes|--comment [--body=-]
 forgejo pr merge <o/r> <n> [--method=merge|rebase|squash]
 
 forgejo repo list <owner> | view <o/r> | create --name=N [--org=O] [--private]
 forgejo release create <o/r> --tag=v1 [--title=T] [--notes=-]
+forgejo release download <o/r> v1 [--pattern='*.tar.gz'] [--output=DIR]
+forgejo issue edit <o/r> <n> --add-labels=bug --remove-assignees=user
 forgejo actions list <o/r> | view <o/r> <run-id> | watch <o/r> <run-id>
 forgejo search issues --query=X [--type=issue|pr]
 ```

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ func init() { Register(newReleaseCmd) }
 
 func newReleaseCmd(ctx *cmdutil.Ctx) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "release <list|create|view|edit|delete|upload-asset|asset>",
+		Use:   "release <list|create|view|edit|delete|download|upload-asset|asset>",
 		Short: "Manage releases and release assets",
 	}
 	cmd.AddCommand(
@@ -36,6 +37,7 @@ func newReleaseCmd(ctx *cmdutil.Ctx) *cobra.Command {
 		newReleaseViewCmd(ctx),
 		newReleaseEditCmd(ctx),
 		newReleaseDeleteCmd(ctx),
+		newReleaseDownloadCmd(ctx),
 		newReleaseUploadAssetCmd(ctx),
 		newReleaseAssetCmd(ctx),
 	)
@@ -54,7 +56,7 @@ func newReleaseListCmd(ctx *cmdutil.Ctx) *cobra.Command {
 				return err
 			}
 			n := ctx.ListLimit(20)
-			lr, err := ctx.Client.DoList("repos/"+repo+"/releases", n)
+			lr, err := ctx.Client.DoList("repos/"+repoAPIPath(repo)+"/releases", n)
 			if err != nil {
 				return err
 			}
@@ -126,7 +128,7 @@ func newReleaseCreateCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			raw, err := ctx.Client.Do("POST", "repos/"+repo+"/releases", body)
+			raw, err := ctx.Client.Do("POST", "repos/"+repoAPIPath(repo)+"/releases", body)
 			if err != nil {
 				return err
 			}
@@ -165,7 +167,7 @@ func newReleaseViewCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			raw, err := ctx.Client.Do("GET", "repos/"+repo+"/releases/"+id, nil)
+			raw, err := ctx.Client.Do("GET", "repos/"+repoAPIPath(repo)+"/releases/"+id, nil)
 			if err != nil {
 				return err
 			}
@@ -252,7 +254,7 @@ func newReleaseEditCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			raw, err := ctx.Client.Do("PATCH", "repos/"+repo+"/releases/"+id, body)
+			raw, err := ctx.Client.Do("PATCH", "repos/"+repoAPIPath(repo)+"/releases/"+id, body)
 			if err != nil {
 				return err
 			}
@@ -292,7 +294,7 @@ func newReleaseDeleteCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			if err := ctx.ConfirmDelete(cmd, "release", tag); err != nil {
 				return err
 			}
-			if _, err := ctx.Client.Do("DELETE", "repos/"+repo+"/releases/tags/"+cmdutil.NameSeg(tag), nil); err != nil {
+			if _, err := ctx.Client.Do("DELETE", "repos/"+repoAPIPath(repo)+"/releases/tags/"+cmdutil.NameSeg(tag), nil); err != nil {
 				return err
 			}
 			fmt.Fprintf(ctx.Out, "Deleted release: %s\n", tag)
@@ -300,6 +302,89 @@ func newReleaseDeleteCmd(ctx *cmdutil.Ctx) *cobra.Command {
 		},
 	}
 	cmdutil.AddYesFlag(cmd)
+	return cmd
+}
+
+func newReleaseDownloadCmd(ctx *cmdutil.Ctx) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "download <owner/repo> <tag> [--pattern=GLOB] [--output=DIR]",
+		Short: "Download release assets",
+		Long:  "Download assets attached to a release by tag. --pattern filters asset names with path.Match; --output is a directory (default: .).",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, err := ctx.RepoArg(args[0])
+			if err != nil {
+				return err
+			}
+			tag := args[1]
+			pattern, _ := cmd.Flags().GetString("pattern")
+			outdir, _ := cmd.Flags().GetString("output")
+			id, err := resolveReleaseID(ctx, repo, tag)
+			if err != nil {
+				return err
+			}
+			raw, err := ctx.Client.Do("GET", "repos/"+repoAPIPath(repo)+"/releases/"+id+"/assets", nil)
+			if err != nil {
+				return err
+			}
+			assets, err := parseReleaseAssets(raw)
+			if err != nil {
+				return err
+			}
+			selected, err := filterReleaseAssets(assets, pattern)
+			if err != nil {
+				return err
+			}
+			if pattern != "" && len(selected) == 0 {
+				return fmt.Errorf("no release assets match pattern %q; available assets: %s", pattern, availableReleaseAssetNames(assets))
+			}
+
+			downloaded := make([]json.RawMessage, 0, len(selected))
+			for _, asset := range selected {
+				fallback := releaseAssetFallback(asset.obj)
+				name := safeBasename(asset.name, fallback)
+				downloadURL := cmdutil.Str(asset.obj, "browser_download_url")
+				if downloadURL == "" {
+					return fmt.Errorf("asset %q has no browser_download_url", name)
+				}
+				dest, err := containedPath(outdir, name)
+				if err != nil {
+					return err
+				}
+				if releaseDryRun(ctx) {
+					if err := downloadReleaseAssetDryRun(ctx, downloadURL); err != nil {
+						return err
+					}
+					if !ctx.WantsJSON() {
+						fmt.Fprintf(ctx.Out, "would write %s\n", dest)
+					}
+				} else {
+					if err := downloadReleaseAsset(ctx, downloadURL, dest); err != nil {
+						return err
+					}
+					if !ctx.WantsJSON() {
+						fmt.Fprintf(ctx.Out, "wrote %s\n", dest)
+					}
+				}
+				downloaded = append(downloaded, asset.raw)
+			}
+			if ctx.WantsJSON() {
+				raw, err := json.Marshal(downloaded)
+				if err != nil {
+					return err
+				}
+				return ctx.EmitJSON(raw)
+			}
+			if releaseDryRun(ctx) {
+				fmt.Fprintf(ctx.Out, "would write %d %s\n", len(selected), fileWord(len(selected)))
+			} else {
+				fmt.Fprintf(ctx.Out, "wrote %d %s\n", len(selected), fileWord(len(selected)))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().String("pattern", "", "glob pattern for asset names")
+	cmd.Flags().String("output", ".", "directory to write downloaded assets into")
 	return cmd
 }
 
@@ -387,7 +472,7 @@ func newReleaseAssetListCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			raw, err := ctx.Client.Do("GET", "repos/"+repo+"/releases/"+id+"/assets", nil)
+			raw, err := ctx.Client.Do("GET", "repos/"+repoAPIPath(repo)+"/releases/"+id+"/assets", nil)
 			if err != nil {
 				return err
 			}
@@ -439,7 +524,7 @@ func newReleaseAssetDownloadCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			raw, err := ctx.Client.Do("GET", "repos/"+repo+"/releases/"+id+"/assets/"+assetID, nil)
+			raw, err := ctx.Client.Do("GET", "repos/"+repoAPIPath(repo)+"/releases/"+id+"/assets/"+assetID, nil)
 			if err != nil {
 				return err
 			}
@@ -492,7 +577,7 @@ func newReleaseAssetDeleteCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if _, err := ctx.Client.Do("DELETE", "repos/"+repo+"/releases/"+id+"/assets/"+assetID, nil); err != nil {
+			if _, err := ctx.Client.Do("DELETE", "repos/"+repoAPIPath(repo)+"/releases/"+id+"/assets/"+assetID, nil); err != nil {
 				return err
 			}
 			fmt.Fprintf(ctx.Out, "Deleted asset #%s\n", assetID)
@@ -504,7 +589,8 @@ func newReleaseAssetDeleteCmd(ctx *cmdutil.Ctx) *cobra.Command {
 }
 
 func resolveReleaseID(ctx *cmdutil.Ctx, repo, tag string) (string, error) {
-	raw, err := ctx.Client.Do("GET", "repos/"+repo+"/releases/tags/"+cmdutil.NameSeg(tag), nil)
+	repoPath := repoAPIPath(repo)
+	raw, err := ctx.Client.Do("GET", "repos/"+repoPath+"/releases/tags/"+cmdutil.NameSeg(tag), nil)
 	if err == nil {
 		obj, err := cmdutil.ParseObject(raw)
 		if err != nil {
@@ -519,7 +605,7 @@ func resolveReleaseID(ctx *cmdutil.Ctx, repo, tag string) (string, error) {
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound {
 		return "", err
 	}
-	raw, err = ctx.Client.DoPaged("repos/" + repo + "/releases")
+	raw, err = ctx.Client.DoPaged("repos/" + repoPath + "/releases")
 	if err != nil {
 		return "", err
 	}
@@ -538,9 +624,81 @@ func resolveReleaseID(ctx *cmdutil.Ctx, repo, tag string) (string, error) {
 	return "", fmt.Errorf("release not found for tag %q", tag)
 }
 
+type releaseAsset struct {
+	raw  json.RawMessage
+	obj  map[string]any
+	name string
+}
+
+func parseReleaseAssets(raw []byte) ([]releaseAsset, error) {
+	var raws []json.RawMessage
+	if err := json.Unmarshal(raw, &raws); err != nil {
+		return nil, fmt.Errorf("unexpected response shape: %w", err)
+	}
+	assets := make([]releaseAsset, 0, len(raws))
+	for _, item := range raws {
+		obj, err := cmdutil.ParseObject(item)
+		if err != nil {
+			return nil, err
+		}
+		assets = append(assets, releaseAsset{
+			raw:  item,
+			obj:  obj,
+			name: cmdutil.Str(obj, "name"),
+		})
+	}
+	return assets, nil
+}
+
+func filterReleaseAssets(assets []releaseAsset, pattern string) ([]releaseAsset, error) {
+	if pattern == "" {
+		return assets, nil
+	}
+	if _, err := pathpkg.Match(pattern, ""); err != nil {
+		return nil, cmdutil.Usagef("invalid --pattern %q: %v", pattern, err)
+	}
+	selected := make([]releaseAsset, 0, len(assets))
+	for _, asset := range assets {
+		ok, err := pathpkg.Match(pattern, asset.name)
+		if err != nil {
+			return nil, cmdutil.Usagef("invalid --pattern %q: %v", pattern, err)
+		}
+		if ok {
+			selected = append(selected, asset)
+		}
+	}
+	return selected, nil
+}
+
+func availableReleaseAssetNames(assets []releaseAsset) string {
+	if len(assets) == 0 {
+		return "(none)"
+	}
+	names := make([]string, 0, len(assets))
+	for _, asset := range assets {
+		name := asset.name
+		if name == "" {
+			name = releaseAssetFallback(asset.obj)
+		}
+		names = append(names, name)
+	}
+	return strings.Join(names, ", ")
+}
+
+func releaseAssetFallback(obj map[string]any) string {
+	if id := cmdutil.Str(obj, "id"); id != "" {
+		return "asset-" + id
+	}
+	return "asset"
+}
+
+func releaseDryRun(ctx *cmdutil.Ctx) bool {
+	return ctx.Client != nil && ctx.Client.DryRun
+}
+
 func uploadReleaseAsset(ctx *cmdutil.Ctx, repo, releaseID, path string) ([]byte, error) {
 	base := safeBasename(filepath.Base(path), "asset")
-	endpoint := fmt.Sprintf("repos/%s/releases/%s/assets?name=%s", repo, releaseID, cmdutil.QueryEscape(base))
+	endpoint := fmt.Sprintf("repos/%s/releases/%s/assets?name=%s", repoAPIPath(repo), releaseID, cmdutil.QueryEscape(base))
 	fullURL := strings.TrimRight(ctx.Client.BaseURL, "/") + "/api/v1/" + endpoint
 	if ctx.Client.DryRun {
 		errw := ctx.Err
@@ -598,6 +756,34 @@ func downloadReleaseAsset(ctx *cmdutil.Ctx, rawURL, dest string) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
+	return readReleaseAsset(ctx, rawURL, dest, func(r io.Reader) error {
+		tmp := dest + ".tmp"
+		f, err := os.Create(tmp)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(f, r)
+		closeErr := f.Close()
+		if copyErr != nil {
+			_ = os.Remove(tmp)
+			return copyErr
+		}
+		if closeErr != nil {
+			_ = os.Remove(tmp)
+			return closeErr
+		}
+		return os.Rename(tmp, dest)
+	})
+}
+
+func downloadReleaseAssetDryRun(ctx *cmdutil.Ctx, rawURL string) error {
+	return readReleaseAsset(ctx, rawURL, "", func(r io.Reader) error {
+		_, err := io.Copy(io.Discard, r)
+		return err
+	})
+}
+
+func readReleaseAsset(ctx *cmdutil.Ctx, rawURL, dest string, consume func(io.Reader) error) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return err
@@ -627,25 +813,12 @@ func downloadReleaseAsset(ctx *cmdutil.Ctx, rawURL, dest string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		out, _ := io.ReadAll(resp.Body)
-		_ = os.Remove(dest)
+		if dest != "" {
+			_ = os.Remove(dest)
+		}
 		return fmt.Errorf("download failed from %s (HTTP %d): %s", rawURL, resp.StatusCode, strings.TrimSpace(string(out)))
 	}
-	tmp := dest + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(f, resp.Body)
-	closeErr := f.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return closeErr
-	}
-	return os.Rename(tmp, dest)
+	return consume(resp.Body)
 }
 
 func releaseHTTPClient(ctx *cmdutil.Ctx) *http.Client {
@@ -723,4 +896,11 @@ func intString(v string) string {
 		return v
 	}
 	return v
+}
+
+func fileWord(n int) string {
+	if n == 1 {
+		return "file"
+	}
+	return "files"
 }

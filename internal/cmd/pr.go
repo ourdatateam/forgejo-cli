@@ -9,8 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/ourdatateam/forgejo-cli/internal/api"
@@ -24,7 +27,7 @@ var prWIPPrefixRe = regexp.MustCompile(`(?i)^[[:space:]]*(\[WIP\]|WIP:)[[:space:
 
 func newPrCmd(ctx *cmdutil.Ctx) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "pr <list|create|view|edit|close|reopen|merge|diff|patch|checks|ready|comment|review|files>",
+		Use:   "pr <list|create|view|edit|checkout|close|reopen|merge|diff|patch|checks|ready|comment|review|files>",
 		Short: "Work with pull requests",
 		Long: `Pull request commands.
 
@@ -32,7 +35,7 @@ The repo positional is always required. Pass "." explicitly to infer the repo
 from a git remote on the configured Forgejo host. Use --json for raw JSON where
 the verb returns JSON; pr diff and pr patch stream raw bytes instead.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return cmdutil.Usagef("Usage: forgejo pr <list|create|view|edit|close|reopen|merge|diff|patch|checks|ready|comment|review|files> [args]")
+			return cmdutil.Usagef("Usage: forgejo pr <list|create|view|edit|checkout|close|reopen|merge|diff|patch|checks|ready|comment|review|files> [args]")
 		},
 	}
 	cmd.AddCommand(
@@ -40,6 +43,7 @@ the verb returns JSON; pr diff and pr patch stream raw bytes instead.`,
 		newPrCreateCmd(ctx),
 		newPrViewCmd(ctx),
 		newPrEditCmd(ctx),
+		newPrCheckoutCmd(ctx),
 		newPrCloseCmd(ctx),
 		newPrReopenCmd(ctx),
 		newPrMergeCmd(ctx),
@@ -210,13 +214,17 @@ func newPrEditCmd(ctx *cmdutil.Ctx) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "edit <owner/repo> <number> [--title=TEXT] [--body=TEXT] [--base=BRANCH]",
 		Short: "Edit a pull request",
-		Long: `Edit a PR's title, body, or base branch.
+		Long: `Edit a PR's title, body, base branch, labels, assignees, or requested reviewers.
 
-At least one of --title, --body/--body-file, or --base is required. --body=-
-and --body-file=- read the replacement body from stdin.`,
+At least one edit flag is required. --body=- and --body-file=- read the
+replacement body from stdin. Label and assignee edits use the issue endpoints
+because Forgejo models PRs as issues for that metadata.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, number, err := prRepoNumber(ctx, args, "Usage: forgejo pr edit <owner/repo> <number> [--title=X] [--body=X] [--base=X]")
 			if err != nil {
+				return err
+			}
+			if err := prEditRejectWholesaleCombos(cmd); err != nil {
 				return err
 			}
 			fields := map[string]any{}
@@ -235,16 +243,64 @@ and --body-file=- read the replacement body from stdin.`,
 				base, _ := cmd.Flags().GetString("base")
 				fields["base"] = base
 			}
-			if len(fields) == 0 {
+			auxChanged := prEditAuxChanged(cmd)
+			if len(fields) == 0 && !auxChanged {
 				return cmdutil.Usagef("No fields to update. Provide --title, --body, or --base.")
 			}
-			body, err := cmdutil.BuildBody(fields)
-			if err != nil {
-				return err
+
+			repoPath := repoAPIPath(repo)
+			var raw []byte
+			if len(fields) != 0 {
+				body, err := cmdutil.BuildBody(fields)
+				if err != nil {
+					return err
+				}
+				raw, err = ctx.Client.Do("PATCH", "repos/"+repoPath+"/pulls/"+number, body)
+				if err != nil {
+					return err
+				}
 			}
-			raw, err := ctx.Client.Do("PATCH", "repos/"+repo+"/pulls/"+number, body)
-			if err != nil {
-				return err
+			if cmd.Flags().Changed("add-labels") {
+				labels, _ := cmd.Flags().GetString("add-labels")
+				if err := prEditAddLabels(ctx, repo, repoPath, number, labels); err != nil {
+					return err
+				}
+			}
+			if cmd.Flags().Changed("remove-labels") {
+				labels, _ := cmd.Flags().GetString("remove-labels")
+				if err := prEditRemoveLabels(ctx, repo, repoPath, number, labels); err != nil {
+					return err
+				}
+			}
+			if cmd.Flags().Changed("add-assignees") {
+				users, _ := cmd.Flags().GetString("add-assignees")
+				if err := prEditUpdateAssignees(ctx, repoPath, number, "add", users); err != nil {
+					return err
+				}
+			}
+			if cmd.Flags().Changed("remove-assignees") {
+				users, _ := cmd.Flags().GetString("remove-assignees")
+				if err := prEditUpdateAssignees(ctx, repoPath, number, "remove", users); err != nil {
+					return err
+				}
+			}
+			if cmd.Flags().Changed("add-reviewers") {
+				users, _ := cmd.Flags().GetString("add-reviewers")
+				if err := prEditRequestedReviewers(ctx, repoPath, number, "add", users); err != nil {
+					return err
+				}
+			}
+			if cmd.Flags().Changed("remove-reviewers") {
+				users, _ := cmd.Flags().GetString("remove-reviewers")
+				if err := prEditRequestedReviewers(ctx, repoPath, number, "remove", users); err != nil {
+					return err
+				}
+			}
+			if auxChanged || len(raw) == 0 {
+				raw, err = ctx.Client.Do("GET", "repos/"+repoPath+"/pulls/"+number, nil)
+				if err != nil {
+					return err
+				}
 			}
 			if ctx.WantsJSON() {
 				return ctx.EmitJSON(raw)
@@ -259,7 +315,36 @@ and --body-file=- read the replacement body from stdin.`,
 	}
 	cmd.Flags().String("title", "", "replacement PR title")
 	cmd.Flags().String("base", "", "replacement base branch")
+	cmd.Flags().String("add-labels", "", "comma-separated label names to add")
+	cmd.Flags().String("remove-labels", "", "comma-separated label names to remove")
+	cmd.Flags().String("add-assignees", "", "comma-separated assignees to add")
+	cmd.Flags().String("remove-assignees", "", "comma-separated assignees to remove")
+	cmd.Flags().String("add-reviewers", "", "comma-separated reviewers to request")
+	cmd.Flags().String("remove-reviewers", "", "comma-separated reviewer requests to withdraw")
 	cmdutil.AddBodyFlags(cmd)
+	return cmd
+}
+
+func newPrCheckoutCmd(ctx *cmdutil.Ctx) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "checkout <owner/repo> <number> [--branch=NAME] [--detach]",
+		Short: "Check out a pull request locally",
+		Long: `Check out a pull request's head ref using git.
+
+The command must run inside a clone with a git remote on the configured
+Forgejo host. It resolves the PR first, then fetches refs/pull/<number>/head
+from the matching remote and switches to the requested local branch. With
+--detach it checks out FETCH_HEAD detached instead.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, number, err := prRepoNumber(ctx, args, "Usage: forgejo pr checkout <owner/repo> <number> [--branch=NAME] [--detach]")
+			if err != nil {
+				return err
+			}
+			return prCheckout(ctx, cmd, repo, number)
+		},
+	}
+	cmd.Flags().String("branch", "", "local branch name to create or update")
+	cmd.Flags().Bool("detach", false, "check out the PR head detached at FETCH_HEAD")
 	return cmd
 }
 
@@ -967,6 +1052,368 @@ func prRawPull(ctx *cmdutil.Ctx, args []string, ext, usage string) error {
 	}
 	_, err = ctx.Out.Write(raw)
 	return err
+}
+
+func prCheckout(ctx *cmdutil.Ctx, cmd *cobra.Command, repo, number string) error {
+	raw, err := ctx.Client.Do("GET", "repos/"+repoAPIPath(repo)+"/pulls/"+number, nil)
+	if err != nil {
+		return err
+	}
+	obj, err := cmdutil.ParseObject(raw)
+	if err != nil {
+		return err
+	}
+	headRef := cmdutil.Str(obj, "head.ref")
+	headSHA := cmdutil.Str(obj, "head.sha")
+	branch, _ := cmd.Flags().GetString("branch")
+	detach, _ := cmd.Flags().GetBool("detach")
+	if !detach && cmd.Flags().Changed("branch") && branch == "" {
+		return cmdutil.Usagef("--branch cannot be empty")
+	}
+	if branch == "" {
+		branch = headRef
+	}
+	if branch == "" {
+		branch = "pr-" + number
+	}
+	remote, err := prGitRemoteForForgejo(ctx, repo)
+	if err != nil {
+		return err
+	}
+
+	var commands [][]string
+	display := branch
+	if detach {
+		commands = [][]string{
+			{"fetch", remote, "refs/pull/" + number + "/head"},
+			{"switch", "--detach", "FETCH_HEAD"},
+		}
+		display = headSHA
+		if display == "" {
+			display = "FETCH_HEAD"
+		}
+	} else {
+		commands = [][]string{
+			{"fetch", remote, "+refs/pull/" + number + "/head:refs/heads/" + branch},
+			{"switch", branch},
+		}
+	}
+	if ctx.Client.DryRun {
+		for _, args := range commands {
+			fmt.Fprintf(prErr(ctx), "DRY-RUN: %s\n", prGitCommandString(args))
+		}
+		return nil
+	}
+	for _, args := range commands {
+		if err := prRunGit(ctx, args...); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(ctx.Out, "Checked out PR #%s as %s\n", number, display)
+	return nil
+}
+
+func prGitRemoteForForgejo(ctx *cmdutil.Ctx, repo string) (string, error) {
+	baseURL := ""
+	if ctx.Config != nil {
+		baseURL = ctx.Config.URL
+	}
+	if baseURL == "" && ctx.Client != nil {
+		baseURL = ctx.Client.BaseURL
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil || base.Host == "" {
+		if err == nil {
+			err = fmt.Errorf("missing host")
+		}
+		return "", fmt.Errorf("invalid FORGEJO_URL: %w", err)
+	}
+	out, err := exec.Command("git", "remote", "-v").Output()
+	if err != nil {
+		return "", cmdutil.Usagef("pr checkout requires running inside a clone of %s with a git remote on %s", repo, base.Host)
+	}
+	seen := map[string]bool{}
+	var matches []string
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if len(fields) >= 3 && fields[2] != "(fetch)" {
+			continue
+		}
+		name, remoteURL := fields[0], fields[1]
+		if seen[name] || !prRemoteHostMatches(remoteURL, base.Host) {
+			continue
+		}
+		seen[name] = true
+		matches = append(matches, name)
+	}
+	for _, name := range matches {
+		if name == "origin" {
+			return name, nil
+		}
+	}
+	if len(matches) != 0 {
+		return matches[0], nil
+	}
+	return "", cmdutil.Usagef("no git remote on %s found; pr checkout requires running inside a clone of %s", base.Host, repo)
+}
+
+func prRemoteHostMatches(remote, host string) bool {
+	host = strings.ToLower(host)
+	if strings.Contains(remote, "://") {
+		u, err := url.Parse(remote)
+		return err == nil && strings.ToLower(u.Host) == host
+	}
+	if strings.Contains(remote, ":") {
+		left, _, _ := strings.Cut(remote, ":")
+		if at := strings.LastIndex(left, "@"); at >= 0 {
+			left = left[at+1:]
+		}
+		return strings.ToLower(left) == host
+	}
+	return false
+}
+
+func prRunGit(ctx *cmdutil.Ctx, args ...string) error {
+	c := exec.Command("git", args...)
+	c.Stdin = ctx.In
+	c.Stdout = ctx.Out
+	c.Stderr = prErr(ctx)
+	return c.Run()
+}
+
+func prGitCommandString(args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, "git")
+	parts = append(parts, args...)
+	for i, part := range parts {
+		parts[i] = prShellQuote(part)
+	}
+	return strings.Join(parts, " ")
+}
+
+func prShellQuote(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\n'\"\\$`") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func prErr(ctx *cmdutil.Ctx) io.Writer {
+	if ctx.Err != nil {
+		return ctx.Err
+	}
+	if ctx.Client != nil && ctx.Client.Stderr != nil {
+		return ctx.Client.Stderr
+	}
+	return os.Stderr
+}
+
+func prEditRejectWholesaleCombos(cmd *cobra.Command) error {
+	for _, pair := range []struct {
+		incremental string
+		wholesale   string
+	}{
+		{"add-labels", "labels"},
+		{"remove-labels", "labels"},
+		{"add-assignees", "assignees"},
+		{"remove-assignees", "assignees"},
+	} {
+		if cmd.Flags().Lookup(pair.wholesale) != nil && cmd.Flags().Changed(pair.incremental) && cmd.Flags().Changed(pair.wholesale) {
+			return cmdutil.Usagef("--%s cannot be used with --%s", pair.incremental, pair.wholesale)
+		}
+	}
+	return nil
+}
+
+func prEditAuxChanged(cmd *cobra.Command) bool {
+	for _, name := range []string{
+		"add-labels",
+		"remove-labels",
+		"add-assignees",
+		"remove-assignees",
+		"add-reviewers",
+		"remove-reviewers",
+	} {
+		if cmd.Flags().Changed(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func prEditAddLabels(ctx *cmdutil.Ctx, repo, repoPath, number, csv string) error {
+	ids, err := prResolveLabelIDs(ctx, repo, csv)
+	if err != nil {
+		return err
+	}
+	req, err := cmdutil.BuildBody(map[string]any{"labels": ids})
+	if err != nil {
+		return err
+	}
+	_, err = ctx.Client.Do("POST", "repos/"+repoPath+"/issues/"+number+"/labels", req)
+	return err
+}
+
+func prEditRemoveLabels(ctx *cmdutil.Ctx, repo, repoPath, number, csv string) error {
+	ids, err := prResolveLabelIDs(ctx, repo, csv)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err := ctx.Client.Do("DELETE", "repos/"+repoPath+"/issues/"+number+"/labels/"+cmdutil.PathEscape(id.String()), nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func prResolveLabelIDs(ctx *cmdutil.Ctx, repo, csv string) ([]json.Number, error) {
+	names := prSplitCSV(csv)
+	if len(names) == 0 {
+		return nil, cmdutil.Usagef("No labels provided")
+	}
+	ids := make([]json.Number, 0, len(names))
+	for _, name := range names {
+		id, err := prResolveLabelID(ctx, repo, name)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, json.Number(id))
+	}
+	return ids, nil
+}
+
+func prResolveLabelID(ctx *cmdutil.Ctx, repo, name string) (string, error) {
+	org := prRepoOwner(repo)
+	orgRaw, err := ctx.Client.Do("GET", "orgs/"+cmdutil.PathEscape(org)+"/labels?limit=50", nil)
+	if err == nil && len(orgRaw) != 0 {
+		if id := prFindLabelID(orgRaw, name); id != "" {
+			return id, nil
+		}
+	}
+	repoRaw, err := ctx.Client.Do("GET", "repos/"+repoAPIPath(repo)+"/labels?limit=50", nil)
+	if err != nil {
+		return "", err
+	}
+	if id := prFindLabelID(repoRaw, name); id != "" {
+		return id, nil
+	}
+	return "", cmdutil.Usagef("Label not found: %s (in org %s or repo %s)", name, org, repo)
+}
+
+func prFindLabelID(raw []byte, name string) string {
+	items, err := cmdutil.ParseArray(raw)
+	if err != nil {
+		return ""
+	}
+	for _, m := range items {
+		if cmdutil.Str(m, "name") == name {
+			id := cmdutil.Str(m, "id")
+			if valid, err := cmdutil.IDArg(id, "label id"); err == nil {
+				return valid
+			}
+		}
+	}
+	return ""
+}
+
+func prEditUpdateAssignees(ctx *cmdutil.Ctx, repoPath, number, op, usersCSV string) error {
+	users := prSplitCSV(usersCSV)
+	if len(users) == 0 {
+		return cmdutil.Usagef("No users provided")
+	}
+	raw, err := ctx.Client.Do("GET", "repos/"+repoPath+"/issues/"+number, nil)
+	if err != nil {
+		return err
+	}
+	obj, err := cmdutil.ParseObject(raw)
+	if err != nil {
+		return err
+	}
+	current := prIssueAssignees(obj)
+	var next []string
+	if op == "add" {
+		seen := map[string]bool{}
+		for _, user := range current {
+			seen[user] = true
+		}
+		for _, user := range users {
+			seen[user] = true
+		}
+		for user := range seen {
+			next = append(next, user)
+		}
+		sort.Strings(next)
+	} else {
+		remove := map[string]bool{}
+		for _, user := range users {
+			remove[user] = true
+		}
+		for _, user := range current {
+			if !remove[user] {
+				next = append(next, user)
+			}
+		}
+	}
+	if next == nil {
+		next = []string{}
+	}
+	req, err := cmdutil.BuildBody(map[string]any{"assignees": next})
+	if err != nil {
+		return err
+	}
+	_, err = ctx.Client.Do("PATCH", "repos/"+repoPath+"/issues/"+number, req)
+	return err
+}
+
+func prIssueAssignees(obj map[string]any) []string {
+	raw, _ := obj["assignees"].([]any)
+	names := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if m, ok := item.(map[string]any); ok {
+			if login := cmdutil.Str(m, "login"); login != "" {
+				names = append(names, login)
+			}
+		}
+	}
+	return names
+}
+
+func prEditRequestedReviewers(ctx *cmdutil.Ctx, repoPath, number, op, usersCSV string) error {
+	reviewers := prSplitCSV(usersCSV)
+	if len(reviewers) == 0 {
+		return cmdutil.Usagef("No reviewers provided")
+	}
+	body, err := cmdutil.BuildBody(map[string]any{"reviewers": reviewers})
+	if err != nil {
+		return err
+	}
+	method := "POST"
+	if op == "remove" {
+		method = "DELETE"
+	}
+	_, err = ctx.Client.Do(method, "repos/"+repoPath+"/pulls/"+number+"/requested_reviewers", body)
+	return err
+}
+
+func prSplitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func prRepoOwner(repo string) string {
+	owner, _, _ := strings.Cut(repo, "/")
+	return owner
 }
 
 type prConversationData struct {

@@ -43,7 +43,7 @@ func newIssueCmd(ctx *cmdutil.Ctx) *cobra.Command {
       Show issue details and all comments inline.
 
   issue edit <owner/repo> <number> [--title=TEXT] [--state=open|closed] [--body=TEXT] [--labels=X,Y]
-      Edit an issue's title, state, body, or labels.
+      Edit an issue's title, state, body, labels, or assignees.
 
   issue comment <owner/repo> <number> --body=TEXT
       Add a comment to an issue.
@@ -285,7 +285,7 @@ func newIssueEditCmd(ctx *cmdutil.Ctx) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "edit <owner/repo> <number> [--title=TEXT] [--state=open|closed] [--body=TEXT] [--labels=X,Y]",
 		Short: "Edit an issue",
-		Long:  "Edit an issue's title, state, body, or labels. Forgejo's EditIssueOption has no labels field, so --labels replaces all labels with a separate PUT to the labels endpoint after the issue PATCH. Passing --labels= with an empty value clears all labels.",
+		Long:  "Edit an issue's title, state, body, labels, or assignees. Forgejo's EditIssueOption has no labels field, so --labels replaces all labels with a separate PUT to the labels endpoint after the issue PATCH. Passing --labels= with an empty value clears all labels. --add-labels and --remove-labels incrementally append or remove labels. --add-assignees and --remove-assignees incrementally update the assignee list.",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, err := ctx.RepoArg(args[0])
@@ -295,6 +295,24 @@ func newIssueEditCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			number, err := cmdutil.IDArg(args[1], "issue number")
 			if err != nil {
 				return err
+			}
+
+			issueEndpoint := "repos/" + repoAPIPath(repo) + "/issues/" + number
+			labelsChanged := cmd.Flags().Changed("labels")
+			addLabelsChanged := cmd.Flags().Changed("add-labels")
+			removeLabelsChanged := cmd.Flags().Changed("remove-labels")
+			assigneesChanged := cmd.Flags().Changed("assignees")
+			addAssigneesChanged := cmd.Flags().Changed("add-assignees")
+			removeAssigneesChanged := cmd.Flags().Changed("remove-assignees")
+			incrementalLabelsChanged := addLabelsChanged || removeLabelsChanged
+			incrementalAssigneesChanged := addAssigneesChanged || removeAssigneesChanged
+			incrementalChanged := incrementalLabelsChanged || incrementalAssigneesChanged
+
+			if labelsChanged && incrementalLabelsChanged {
+				return cmdutil.Usagef("cannot combine --labels with --add-labels or --remove-labels")
+			}
+			if assigneesChanged && incrementalAssigneesChanged {
+				return cmdutil.Usagef("cannot combine --assignees with --add-assignees or --remove-assignees")
 			}
 
 			fields := map[string]any{}
@@ -313,9 +331,12 @@ func newIssueEditCmd(ctx *cmdutil.Ctx) *cobra.Command {
 			if bodyPresent {
 				fields["body"] = bodyText
 			}
+			if assigneesChanged {
+				v, _ := cmd.Flags().GetString("assignees")
+				fields["assignees"] = splitIssueCSV(v, true)
+			}
 
 			var labelIDs []json.Number
-			labelsChanged := cmd.Flags().Changed("labels")
 			if labelsChanged {
 				labels, _ := cmd.Flags().GetString("labels")
 				labelIDs, err = resolveLabelIDs(ctx, repo, labels)
@@ -323,32 +344,104 @@ func newIssueEditCmd(ctx *cmdutil.Ctx) *cobra.Command {
 					return err
 				}
 			}
-			if len(fields) == 0 && !labelsChanged {
+
+			var addLabelIDs []json.Number
+			if addLabelsChanged {
+				labels, _ := cmd.Flags().GetString("add-labels")
+				addLabelIDs, err = resolveLabelIDs(ctx, repo, labels)
+				if err != nil {
+					return err
+				}
+			}
+			var removeLabelIDs []json.Number
+			if removeLabelsChanged {
+				labels, _ := cmd.Flags().GetString("remove-labels")
+				removeLabelIDs, err = resolveLabelIDs(ctx, repo, labels)
+				if err != nil {
+					return err
+				}
+			}
+			if incrementalAssigneesChanged {
+				raw, err := ctx.Client.Do("GET", issueEndpoint, nil)
+				if err != nil {
+					return err
+				}
+				obj, err := cmdutil.ParseObject(raw)
+				if err != nil {
+					return err
+				}
+				addAssignees, _ := cmd.Flags().GetString("add-assignees")
+				removeAssignees, _ := cmd.Flags().GetString("remove-assignees")
+				next, err := mergeIssueEditAssignees(issueAssignees(obj), addAssignees, removeAssignees, addAssigneesChanged, removeAssigneesChanged)
+				if err != nil {
+					return err
+				}
+				fields["assignees"] = next
+			}
+			if len(fields) == 0 && !labelsChanged && !incrementalLabelsChanged {
 				return cmdutil.Usagef("No fields to update. Provide --title, --state, --body, or --labels.")
 			}
 
 			var result []byte
-			if len(fields) != 0 {
-				req, err := cmdutil.BuildBody(fields)
-				if err != nil {
-					return err
+			if incrementalChanged {
+				if labelsChanged {
+					req, err := cmdutil.BuildBody(map[string]any{"labels": labelIDs})
+					if err != nil {
+						return err
+					}
+					if _, err := ctx.Client.Do("PUT", issueEndpoint+"/labels", req); err != nil {
+						return err
+					}
 				}
-				result, err = ctx.Client.Do("PATCH", "repos/"+repoAPIPath(repo)+"/issues/"+number, req)
-				if err != nil {
-					return err
+				if addLabelsChanged {
+					req, err := cmdutil.BuildBody(map[string]any{"labels": addLabelIDs})
+					if err != nil {
+						return err
+					}
+					if _, err := ctx.Client.Do("POST", issueEndpoint+"/labels", req); err != nil {
+						return err
+					}
 				}
-			}
-			if labelsChanged {
-				req, err := cmdutil.BuildBody(map[string]any{"labels": labelIDs})
-				if err != nil {
-					return err
+				if removeLabelsChanged {
+					for _, id := range removeLabelIDs {
+						if _, err := ctx.Client.Do("DELETE", issueEndpoint+"/labels/"+id.String(), nil); err != nil {
+							return err
+						}
+					}
 				}
-				if _, err := ctx.Client.Do("PUT", "repos/"+repoAPIPath(repo)+"/issues/"+number+"/labels", req); err != nil {
-					return err
+				if len(fields) != 0 {
+					req, err := cmdutil.BuildBody(fields)
+					if err != nil {
+						return err
+					}
+					result, err = ctx.Client.Do("PATCH", issueEndpoint, req)
+					if err != nil {
+						return err
+					}
+				}
+			} else {
+				if len(fields) != 0 {
+					req, err := cmdutil.BuildBody(fields)
+					if err != nil {
+						return err
+					}
+					result, err = ctx.Client.Do("PATCH", issueEndpoint, req)
+					if err != nil {
+						return err
+					}
+				}
+				if labelsChanged {
+					req, err := cmdutil.BuildBody(map[string]any{"labels": labelIDs})
+					if err != nil {
+						return err
+					}
+					if _, err := ctx.Client.Do("PUT", issueEndpoint+"/labels", req); err != nil {
+						return err
+					}
 				}
 			}
 			if len(result) == 0 {
-				result, err = ctx.Client.Do("GET", "repos/"+repoAPIPath(repo)+"/issues/"+number, nil)
+				result, err = ctx.Client.Do("GET", issueEndpoint, nil)
 				if err != nil {
 					return err
 				}
@@ -367,6 +460,11 @@ func newIssueEditCmd(ctx *cmdutil.Ctx) *cobra.Command {
 	cmd.Flags().String("title", "", "new issue title")
 	cmd.Flags().String("state", "", "new issue state (open or closed)")
 	cmd.Flags().String("labels", "", "comma-separated label names to replace all labels; empty clears all labels")
+	cmd.Flags().String("add-labels", "", "comma-separated label names to add")
+	cmd.Flags().String("remove-labels", "", "comma-separated label names to remove")
+	cmd.Flags().String("assignees", "", "comma-separated assignee logins to replace all assignees; empty clears all assignees")
+	cmd.Flags().String("add-assignees", "", "comma-separated assignee logins to add")
+	cmd.Flags().String("remove-assignees", "", "comma-separated assignee logins to remove")
 	cmdutil.AddBodyFlags(cmd)
 	return cmd
 }
@@ -1254,6 +1352,51 @@ func resolveMilestoneID(ctx *cmdutil.Ctx, repo, input string) (string, error) {
 		}
 	}
 	return "", cmdutil.Usagef("Milestone not found: %s (in %s)", input, repo)
+}
+
+func mergeIssueEditAssignees(current []string, addCSV, removeCSV string, addChanged, removeChanged bool) ([]string, error) {
+	add := splitIssueCSV(addCSV, true)
+	remove := splitIssueCSV(removeCSV, true)
+	if addChanged && len(add) == 0 {
+		return nil, cmdutil.Usagef("No users provided")
+	}
+	if removeChanged && len(remove) == 0 {
+		return nil, cmdutil.Usagef("No users provided")
+	}
+
+	seen := map[string]bool{}
+	next := make([]string, 0, len(current)+len(add))
+	for _, u := range current {
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		next = append(next, u)
+	}
+	for _, u := range add {
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		next = append(next, u)
+	}
+	if len(remove) != 0 {
+		removeSet := map[string]bool{}
+		for _, u := range remove {
+			removeSet[u] = true
+		}
+		kept := next[:0]
+		for _, u := range next {
+			if !removeSet[u] {
+				kept = append(kept, u)
+			}
+		}
+		next = kept
+	}
+	if next == nil {
+		return []string{}, nil
+	}
+	return next, nil
 }
 
 func updateIssueAssignees(ctx *cmdutil.Ctx, repo, number, op, usersCSV string) error {

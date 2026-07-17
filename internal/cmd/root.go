@@ -55,6 +55,7 @@ func NewRoot(ctx *cmdutil.Ctx) *cobra.Command {
 	pf.IntVar(&ctx.Limit, "limit", -1, "max items for list verbs (0 = fetch all pages; default: per-verb)")
 	pf.Bool("dry-run", false, "print mutating requests instead of sending them")
 	pf.Bool("verbose", false, "log requests to stderr (tokens are never logged)")
+	pf.StringP("repo", "R", "", "target repository as owner/repo (gh-style alternative to the repo positional; '.' infers from the cwd git remote)")
 
 	for _, g := range groups {
 		root.AddCommand(g(ctx))
@@ -84,7 +85,11 @@ func initClient(cmd *cobra.Command, ctx *cmdutil.Ctx) error {
 func Main() int {
 	ctx := &cmdutil.Ctx{Out: os.Stdout, Err: os.Stderr, In: os.Stdin}
 	root := NewRoot(ctx)
-	err := root.Execute()
+	args, err := PreprocessRepoFlag(root, os.Args[1:])
+	if err == nil {
+		root.SetArgs(args)
+		err = root.Execute()
+	}
 	if err == nil {
 		return ExitOK
 	}
