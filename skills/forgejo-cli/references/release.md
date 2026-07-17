@@ -17,7 +17,7 @@ These inherited flags apply to commands in this group unless a command defines a
 
 ## forgejo release asset
 
-Use: `forgejo release asset <list|download|delete>`
+Use: `forgejo release asset <list|download|delete|upload>`
 
 Manage release assets
 
@@ -54,6 +54,17 @@ List assets attached to a release. The tag is resolved to a release id before fe
 | Name | Type | Default | Help |
 | :--- | :--- | :--- | :--- |
 | _None_ |  |  |  |
+
+## forgejo release asset upload
+
+Use: `forgejo release asset upload <owner/repo> <tag> --file=PATH [--name=NAME]`
+
+Upload one asset file to a release. --file is required; --name defaults to the file basename.
+
+| Name | Type | Default | Help |
+| :--- | :--- | :--- | :--- |
+| `--file` | `string` | `""` | file to upload |
+| `--name` | `string` | `""` | asset name (default: file basename) |
 
 ## forgejo release create
 

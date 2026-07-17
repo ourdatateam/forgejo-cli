@@ -450,10 +450,10 @@ func newReleaseUploadAssetCmd(ctx *cmdutil.Ctx) *cobra.Command {
 
 func newReleaseAssetCmd(ctx *cmdutil.Ctx) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "asset <list|download|delete>",
+		Use:   "asset <list|download|delete|upload>",
 		Short: "Manage release assets",
 	}
-	cmd.AddCommand(newReleaseAssetListCmd(ctx), newReleaseAssetDownloadCmd(ctx), newReleaseAssetDeleteCmd(ctx))
+	cmd.AddCommand(newReleaseAssetListCmd(ctx), newReleaseAssetDownloadCmd(ctx), newReleaseAssetDeleteCmd(ctx), newReleaseAssetUploadCmd(ctx))
 	return cmd
 }
 
@@ -588,6 +588,52 @@ func newReleaseAssetDeleteCmd(ctx *cmdutil.Ctx) *cobra.Command {
 	return cmd
 }
 
+func newReleaseAssetUploadCmd(ctx *cmdutil.Ctx) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "upload <owner/repo> <tag> --file=PATH [--name=NAME]",
+		Short: "Upload a release asset",
+		Long:  "Upload one asset file to a release. --file is required; --name defaults to the file basename.",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, err := ctx.RepoArg(args[0])
+			if err != nil {
+				return err
+			}
+			file, _ := cmd.Flags().GetString("file")
+			if file == "" {
+				return cmdutil.Usagef("Missing --file")
+			}
+			if err := validateReleaseAssetFile(file); err != nil {
+				return err
+			}
+			name, _ := cmd.Flags().GetString("name")
+			if name == "" {
+				name = filepath.Base(file)
+			}
+			id, err := resolveReleaseID(ctx, repo, args[1])
+			if err != nil {
+				return err
+			}
+			raw, err := uploadReleaseAssetWithName(ctx, repo, id, file, name, false)
+			if err != nil {
+				return err
+			}
+			if ctx.WantsJSON() {
+				return ctx.EmitJSON(raw)
+			}
+			obj, err := cmdutil.ParseObject(raw)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(ctx.Out, "uploaded %s (id %s)\n", name, cmdutil.Str(obj, "id"))
+			return nil
+		},
+	}
+	cmd.Flags().String("file", "", "file to upload")
+	cmd.Flags().String("name", "", "asset name (default: file basename)")
+	return cmd
+}
+
 func resolveReleaseID(ctx *cmdutil.Ctx, repo, tag string) (string, error) {
 	repoPath := repoAPIPath(repo)
 	raw, err := ctx.Client.Do("GET", "repos/"+repoPath+"/releases/tags/"+cmdutil.NameSeg(tag), nil)
@@ -696,30 +742,55 @@ func releaseDryRun(ctx *cmdutil.Ctx) bool {
 	return ctx.Client != nil && ctx.Client.DryRun
 }
 
+func validateReleaseAssetFile(path string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file: %s", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+	return nil
+}
+
 func uploadReleaseAsset(ctx *cmdutil.Ctx, repo, releaseID, path string) ([]byte, error) {
 	base := safeBasename(filepath.Base(path), "asset")
-	endpoint := fmt.Sprintf("repos/%s/releases/%s/assets?name=%s", repoAPIPath(repo), releaseID, cmdutil.QueryEscape(base))
+	return uploadReleaseAssetWithName(ctx, repo, releaseID, path, base, true)
+}
+
+func uploadReleaseAssetWithName(ctx *cmdutil.Ctx, repo, releaseID, path, name string, includeNameField bool) ([]byte, error) {
+	if name == "" {
+		name = safeBasename(filepath.Base(path), "asset")
+	}
+	endpoint := fmt.Sprintf("repos/%s/releases/%s/assets?name=%s", repoAPIPath(repo), releaseID, cmdutil.QueryEscape(name))
 	fullURL := strings.TrimRight(ctx.Client.BaseURL, "/") + "/api/v1/" + endpoint
 	if ctx.Client.DryRun {
 		errw := ctx.Err
 		if ctx.Client.Stderr != nil {
 			errw = ctx.Client.Stderr
 		}
-		fmt.Fprintf(errw, "DRY-RUN: POST %s\nmultipart: name=%s attachment=%s\n", fullURL, base, path)
+		fmt.Fprintf(errw, "DRY-RUN: POST %s\nmultipart: name=%s attachment=%s\n", fullURL, name, path)
 		return nil, api.ErrDryRun
 	}
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	if err := mw.WriteField("name", base); err != nil {
-		return nil, err
+	if includeNameField {
+		if err := mw.WriteField("name", name); err != nil {
+			return nil, err
+		}
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	part, err := mw.CreateFormFile("attachment", base)
+	part, err := mw.CreateFormFile("attachment", name)
 	if err != nil {
 		return nil, err
 	}
@@ -730,14 +801,31 @@ func uploadReleaseAsset(ctx *cmdutil.Ctx, repo, releaseID, path string) ([]byte,
 		return nil, err
 	}
 
+	base, err := url.Parse(ctx.Client.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	target, err := url.Parse(fullURL)
+	if err != nil {
+		return nil, err
+	}
+	client := cloneHTTPClient(releaseHTTPClient(ctx))
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !sameOrigin(req.URL, base) {
+			req.Header.Del("Authorization")
+		}
+		return nil
+	}
 	req, err := http.NewRequest("POST", fullURL, &buf)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "token "+ctx.Client.Token)
+	if sameOrigin(target, base) && ctx.Client.Token != "" {
+		req.Header.Set("Authorization", "token "+ctx.Client.Token)
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := releaseHTTPClient(ctx).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("forgejo: network error: %w", err)
 	}
