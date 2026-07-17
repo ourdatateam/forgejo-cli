@@ -83,6 +83,23 @@ raw-JSON output contract make a thin client the better fit).
 - Parity harness (`scripts/parity.sh`): bash vs Go `--json` on read verbs,
   normalized with `jq -S`; exit codes asserted.
 
+## gh-compatibility additions (Go-only, not in the bash reference)
+
+Additive surface modeled on the gh CLI so gh-trained agents transfer; none
+of it changes existing grammar, output, or exit codes:
+
+- `-R`/`--repo owner/repo` accepted anywhere on the command line as an
+  alternative to the repo positional (argv is rewritten before parsing; the
+  `api` command's raw args are never rewritten). `-R .` infers like the
+  positional dot.
+- `pr checkout <repo> <n> [--branch=NAME] [--detach]` — fetches
+  `refs/pull/<n>/head` from the git remote matching the configured host.
+- `pr edit` / `issue edit`: `--add-labels/--remove-labels`,
+  `--add-assignees/--remove-assignees` incremental flags (mutually
+  exclusive with the wholesale flags); `pr edit
+  --add-reviewers/--remove-reviewers` for review requests.
+- `release download <repo> <tag> [--pattern=GLOB] [--output=DIR]`.
+
 ## Dry-run
 
 `--dry-run` is enforced in the transport: GET/HEAD execute (resolution reads

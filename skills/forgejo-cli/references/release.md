@@ -13,10 +13,11 @@ These inherited flags apply to commands in this group unless a command defines a
 | `--json` | `bool` | `false` | output raw JSON from the server |
 | `--limit` | `int` | `-1` | max items for list verbs (0 = fetch all pages; default: per-verb) |
 | `--verbose` | `bool` | `false` | log requests to stderr (tokens are never logged) |
+| `-R, --repo` | `string` | `""` | target repository as owner/repo (gh-style alternative to the repo positional; '.' infers from the cwd git remote) |
 
 ## forgejo release asset
 
-Use: `forgejo release asset <list|download|delete>`
+Use: `forgejo release asset <list|download|delete|upload>`
 
 Manage release assets
 
@@ -54,6 +55,17 @@ List assets attached to a release. The tag is resolved to a release id before fe
 | :--- | :--- | :--- | :--- |
 | _None_ |  |  |  |
 
+## forgejo release asset upload
+
+Use: `forgejo release asset upload <owner/repo> <tag> --file=PATH [--name=NAME]`
+
+Upload one asset file to a release. --file is required; --name defaults to the file basename.
+
+| Name | Type | Default | Help |
+| :--- | :--- | :--- | :--- |
+| `--file` | `string` | `""` | file to upload |
+| `--name` | `string` | `""` | asset name (default: file basename) |
+
 ## forgejo release create
 
 Use: `forgejo release create <owner/repo> --tag=X --title=X [--body=X|--body-file=path] [--draft] [--prerelease]`
@@ -78,6 +90,17 @@ Delete a release by tag. This is destructive and requires --yes or a typed tag c
 | Name | Type | Default | Help |
 | :--- | :--- | :--- | :--- |
 | `--yes` | `bool` | `false` | skip the delete confirmation prompt |
+
+## forgejo release download
+
+Use: `forgejo release download <owner/repo> <tag> [--pattern=GLOB] [--output=DIR]`
+
+Download assets attached to a release by tag. --pattern filters asset names with path.Match; --output is a directory (default: .).
+
+| Name | Type | Default | Help |
+| :--- | :--- | :--- | :--- |
+| `--output` | `string` | `.` | directory to write downloaded assets into |
+| `--pattern` | `string` | `""` | glob pattern for asset names |
 
 ## forgejo release edit
 

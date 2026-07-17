@@ -12,7 +12,7 @@ Issue commands:
       Show issue details and all comments inline.
 
   issue edit <owner/repo> <number> [--title=TEXT] [--state=open|closed] [--body=TEXT] [--labels=X,Y]
-      Edit an issue's title, state, body, or labels.
+      Edit an issue's title, state, body, labels, or assignees.
 
   issue comment <owner/repo> <number> --body=TEXT
       Add a comment to an issue.
@@ -74,6 +74,7 @@ These inherited flags apply to commands in this group unless a command defines a
 | `--json` | `bool` | `false` | output raw JSON from the server |
 | `--limit` | `int` | `-1` | max items for list verbs (0 = fetch all pages; default: per-verb) |
 | `--verbose` | `bool` | `false` | log requests to stderr (tokens are never logged) |
+| `-R, --repo` | `string` | `""` | target repository as owner/repo (gh-style alternative to the repo positional; '.' infers from the cwd git remote) |
 
 ## forgejo issue assign
 
@@ -149,13 +150,18 @@ Create a new issue. --title is required. --body may be text, --body=- to read st
 
 Use: `forgejo issue edit <owner/repo> <number> [--title=TEXT] [--state=open|closed] [--body=TEXT] [--labels=X,Y]`
 
-Edit an issue's title, state, body, or labels. Forgejo's EditIssueOption has no labels field, so --labels replaces all labels with a separate PUT to the labels endpoint after the issue PATCH. Passing --labels= with an empty value clears all labels.
+Edit an issue's title, state, body, labels, or assignees. Forgejo's EditIssueOption has no labels field, so --labels replaces all labels with a separate PUT to the labels endpoint after the issue PATCH. Passing --labels= with an empty value clears all labels. --add-labels and --remove-labels incrementally append or remove labels. --add-assignees and --remove-assignees incrementally update the assignee list.
 
 | Name | Type | Default | Help |
 | :--- | :--- | :--- | :--- |
+| `--add-assignees` | `string` | `""` | comma-separated assignee logins to add |
+| `--add-labels` | `string` | `""` | comma-separated label names to add |
+| `--assignees` | `string` | `""` | comma-separated assignee logins to replace all assignees; empty clears all assignees |
 | `--body` | `string` | `""` | body text ('-' reads stdin) |
 | `--body-file` | `string` | `""` | read body from a file |
 | `--labels` | `string` | `""` | comma-separated label names to replace all labels; empty clears all labels |
+| `--remove-assignees` | `string` | `""` | comma-separated assignee logins to remove |
+| `--remove-labels` | `string` | `""` | comma-separated label names to remove |
 | `--state` | `string` | `""` | new issue state (open or closed) |
 | `--title` | `string` | `""` | new issue title |
 

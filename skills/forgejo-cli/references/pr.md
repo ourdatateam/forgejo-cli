@@ -17,6 +17,23 @@ These inherited flags apply to commands in this group unless a command defines a
 | `--json` | `bool` | `false` | output raw JSON from the server |
 | `--limit` | `int` | `-1` | max items for list verbs (0 = fetch all pages; default: per-verb) |
 | `--verbose` | `bool` | `false` | log requests to stderr (tokens are never logged) |
+| `-R, --repo` | `string` | `""` | target repository as owner/repo (gh-style alternative to the repo positional; '.' infers from the cwd git remote) |
+
+## forgejo pr checkout
+
+Use: `forgejo pr checkout <owner/repo> <number> [--branch=NAME] [--detach]`
+
+Check out a pull request's head ref using git.
+
+The command must run inside a clone with a git remote on the configured
+Forgejo host. It resolves the PR first, then fetches refs/pull/<number>/head
+from the matching remote and switches to the requested local branch. With
+--detach it checks out FETCH_HEAD detached instead.
+
+| Name | Type | Default | Help |
+| :--- | :--- | :--- | :--- |
+| `--branch` | `string` | `""` | local branch name to create or update |
+| `--detach` | `bool` | `false` | check out the PR head detached at FETCH_HEAD |
 
 ## forgejo pr checks
 
@@ -152,16 +169,23 @@ Show the raw unified diff for a PR. This streams bytes with Accept: */* and does
 
 Use: `forgejo pr edit <owner/repo> <number> [--title=TEXT] [--body=TEXT] [--base=BRANCH]`
 
-Edit a PR's title, body, or base branch.
+Edit a PR's title, body, base branch, labels, assignees, or requested reviewers.
 
-At least one of --title, --body/--body-file, or --base is required. --body=-
-and --body-file=- read the replacement body from stdin.
+At least one edit flag is required. --body=- and --body-file=- read the
+replacement body from stdin. Label and assignee edits use the issue endpoints
+because Forgejo models PRs as issues for that metadata.
 
 | Name | Type | Default | Help |
 | :--- | :--- | :--- | :--- |
+| `--add-assignees` | `string` | `""` | comma-separated assignees to add |
+| `--add-labels` | `string` | `""` | comma-separated label names to add |
+| `--add-reviewers` | `string` | `""` | comma-separated reviewers to request |
 | `--base` | `string` | `""` | replacement base branch |
 | `--body` | `string` | `""` | body text ('-' reads stdin) |
 | `--body-file` | `string` | `""` | read body from a file |
+| `--remove-assignees` | `string` | `""` | comma-separated assignees to remove |
+| `--remove-labels` | `string` | `""` | comma-separated label names to remove |
+| `--remove-reviewers` | `string` | `""` | comma-separated reviewer requests to withdraw |
 | `--title` | `string` | `""` | replacement PR title |
 
 ## forgejo pr files

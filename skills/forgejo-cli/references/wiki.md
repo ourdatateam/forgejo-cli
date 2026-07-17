@@ -20,6 +20,7 @@ These inherited flags apply to commands in this group unless a command defines a
 | `--json` | `bool` | `false` | output raw JSON from the server |
 | `--limit` | `int` | `-1` | max items for list verbs (0 = fetch all pages; default: per-verb) |
 | `--verbose` | `bool` | `false` | log requests to stderr (tokens are never logged) |
+| `-R, --repo` | `string` | `""` | target repository as owner/repo (gh-style alternative to the repo positional; '.' infers from the cwd git remote) |
 
 ## forgejo wiki create
 
