@@ -7,3 +7,8 @@
 
 # Superpowers planning artifacts (design specs / implementation plans) — never commit
 docs/superpowers/
+
+# Go build artifacts
+/bin/
+/dist/
+forgejo-go
