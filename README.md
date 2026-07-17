@@ -23,26 +23,46 @@ output: `forgejo issue list o/r --jq '.[].number'`.
 
 ## Install
 
-The installed CLI is a **symlink** into the working copy — this lets you
-test feature branches by checking them out (see
-[CONTRIBUTING.md](CONTRIBUTING.md)).
+### Go binary (recommended)
+
+Grab the tarball for your platform from the repo's releases page
+(`darwin`/`linux`, `amd64`/`arm64` — static binaries, no runtime
+dependencies), verify against `SHA256SUMS`, and drop it on your `PATH`:
+
+```bash
+tar -xzf forgejo_<version>_<os>_<arch>.tar.gz
+install -m 755 forgejo ~/.local/bin/forgejo
+forgejo --version
+```
+
+Or build from source (Go ≥ 1.24):
+
+```bash
+git clone https://github.com/ourdatateam/forgejo-cli.git && cd forgejo-cli
+make build                    # → bin/forgejo for this machine
+make release                  # → dist/ tarballs for darwin/linux, amd64/arm64
+```
+
+Cross-compiling needs nothing beyond the Go toolchain: the dependency tree
+is pure Go, so `make release` produces all four platforms from any host
+(`CGO_ENABLED=0`, version stamped from `git describe`). See
+[docs/RELEASING.md](docs/RELEASING.md) for cutting a release.
+
+### Bash script (reference implementation)
+
+The original single-file script still works and stays in-tree during the
+transition. It installs as a **symlink** into the working copy — this lets
+you test feature branches by checking them out (see
+[CONTRIBUTING.md](CONTRIBUTING.md)):
 
 ```bash
 REPO="$HOME/projects/forgejo-cli"   # adjust to your preferred clone location
 mkdir -p ~/.local/bin "$(dirname "$REPO")"
-git clone https://github.com/IoTReady/forgejo-cli.git "$REPO"
+git clone https://github.com/ourdatateam/forgejo-cli.git "$REPO"
 ln -sf "$REPO/forgejo" ~/.local/bin/forgejo
 ```
 
-Make sure `~/.local/bin` is on your `PATH`.
-
-### Updating
-
-```bash
-REPO="$HOME/projects/forgejo-cli"   # same as Install
-cd "$REPO" && git checkout main && git pull
-```
-
+Updating the symlink install: `cd "$REPO" && git checkout main && git pull`.
 Plain `git pull` on a feature branch updates the feature, not the installed
 stable — be deliberate.
 
