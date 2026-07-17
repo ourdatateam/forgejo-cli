@@ -18,9 +18,18 @@
 
 ## Repo facts
 
-- Single-file bash CLI at `./forgejo`. Helpers (`api_call`,
-  `api_call_status`, `api_call_raw`, `api_call_basic`, `get_flag`,
-  `has_flag`, `confirm_delete`) live near the top.
+- **Go CLI** (primary): `cmd/forgejo` + `internal/{api,cmd,cmdutil,config}`.
+  One file per command group in `internal/cmd/`. Shared plumbing lives in
+  `internal/cmdutil` (output, repo resolution, confirmation) and
+  `internal/api` (client, pagination, retries, dry-run). Read
+  `docs/PORT.md` before changing output or exit-code behavior — both are
+  contracts. `make build test docs-check` before any commit touching Go.
+  Skill references under `skills/forgejo-cli/references/` are GENERATED
+  (`make docs`) — never hand-edit them; edit command Long/Short text instead.
+- Single-file bash CLI at `./forgejo` (behavioral reference during the
+  transition — port bash semantics, don't "fix" them from API docs).
+  Helpers (`api_call`, `api_call_status`, `api_call_raw`, `api_call_basic`,
+  `get_flag`, `has_flag`, `confirm_delete`) live near the top.
 - Token + URL in `~/.config/forgejo-cli/config` (mode 600), read at script
   startup. Do not log token contents.
 - Branch protection on `main` is project policy: a single-maintainer merge

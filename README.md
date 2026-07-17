@@ -1,10 +1,25 @@
 # forgejo-cli
 
-Bash wrapper around the [Forgejo](https://forgejo.org/) REST API.
+CLI for the [Forgejo](https://forgejo.org/) REST API. Manages repos, issues,
+PRs, releases, users, orgs, actions, and admin operations on a Forgejo
+instance. Built because Forgejo doesn't expose GraphQL, so `gh` doesn't work
+against it.
 
-Single-file script. Manages repos, issues, PRs, releases, users, orgs,
-actions, and admin operations on a Forgejo instance. Built because Forgejo
-doesn't expose GraphQL, so `gh` doesn't work against it.
+Two implementations live in this repo during the transition:
+
+- **Go CLI** (`cmd/forgejo`, `internal/`) — the current implementation.
+  Single static binary, no runtime dependencies. Build with `make build`
+  (binary lands in `bin/forgejo`). Design record and deliberate behavior
+  changes: [docs/PORT.md](docs/PORT.md). Agent-facing usage docs ship as a
+  skill in [skills/forgejo-cli/](skills/forgejo-cli/) (`make docs`
+  regenerates the per-group references from the command tree).
+- **Bash script** (`./forgejo`) — the original single-file implementation,
+  kept as the behavioral reference. `scripts/parity.sh` diffs the two on
+  read verbs; `scripts/acceptance.sh` exercises the Go binary against a
+  throwaway repo it creates and deletes.
+
+The Go CLI needs `jq` for nothing — `--jq` is built in (gojq). Filter any
+output: `forgejo issue list o/r --jq '.[].number'`.
 
 ## Install
 
